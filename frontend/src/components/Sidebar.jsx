@@ -1,7 +1,8 @@
-import React from "react";
+import React, { useState } from "react";
 import { motion } from "framer-motion";
-import { Plus, MessageSquare, Trash2, LogOut, Sparkles, Send, Lock } from "lucide-react";
+import { Plus, MessageSquare, Trash2, LogOut, Sparkles, Send, Lock, ShieldCheck } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
+import AdminPanel from "@/components/AdminPanel";
 import {
   Avatar, AvatarFallback, AvatarImage,
 } from "@/components/ui/avatar";
@@ -12,6 +13,7 @@ function initials(name = "") {
 
 export default function Sidebar({ conversations, activeId, onSelect, onNew, onDelete }) {
   const { user, logout } = useAuth();
+  const [adminOpen, setAdminOpen] = useState(false);
 
   return (
     <div data-testid="history-sidebar" className="flex h-full flex-col bg-[#050506] border-r border-white/[0.06]">
@@ -100,13 +102,28 @@ export default function Sidebar({ conversations, activeId, onSelect, onNew, onDe
       </div>
 
       <div className="border-t border-white/[0.06] p-3">
+        {user?.is_admin && (
+          <button
+            data-testid="open-admin-panel"
+            onClick={() => setAdminOpen(true)}
+            className="w-full mb-2 flex items-center gap-2 rounded-xl border border-violet-500/25 bg-violet-500/10 hover:bg-violet-500/20 text-violet-200 hover:text-white px-3 py-2 text-sm font-medium transition-colors"
+          >
+            <ShieldCheck className="h-4 w-4" strokeWidth={1.75} />
+            Админ-панель
+          </button>
+        )}
         <div className="flex items-center gap-3 rounded-xl px-2 py-2">
           <Avatar className="h-8 w-8 ring-1 ring-white/10">
             <AvatarImage src={user?.photo_url} alt={user?.first_name} />
             <AvatarFallback className="bg-white/10 text-white text-xs">{initials(user?.first_name)}</AvatarFallback>
           </Avatar>
           <div className="flex-1 min-w-0">
-            <p className="text-sm text-white truncate">{user?.first_name} {user?.last_name || ""}</p>
+            <p className="text-sm text-white truncate">
+              {user?.first_name} {user?.last_name || ""}
+              {user?.is_premium && !user?.is_admin && (
+                <span className="ml-1.5 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-[1px] text-[9px] uppercase tracking-wider font-mono align-middle">premium</span>
+              )}
+            </p>
             <p className="text-[11px] text-white/40 truncate">
               {user?.username ? `@${user.username}` : `ID ${user?.tg_id}`}
             </p>
@@ -116,6 +133,7 @@ export default function Sidebar({ conversations, activeId, onSelect, onNew, onDe
           </button>
         </div>
       </div>
+      <AdminPanel open={adminOpen} onClose={() => setAdminOpen(false)} />
     </div>
   );
 }
