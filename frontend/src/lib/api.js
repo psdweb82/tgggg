@@ -37,6 +37,16 @@ export const api = {
   getConversation: (id) => req(`/conversations/${id}`),
   renameConversation: (id, title) => req(`/conversations/${id}`, { method: "PATCH", body: { title } }),
   deleteConversation: (id) => req(`/conversations/${id}`, { method: "DELETE" }),
+
+  // Admin
+  adminStats: () => req("/admin/stats"),
+  adminSearchUsers: (query = "", limit = 30) =>
+    req(`/admin/users?query=${encodeURIComponent(query)}&limit=${limit}`),
+  adminGrantPremium: ({ tg_id, username, days }) =>
+    req("/admin/premium", { method: "POST", body: { tg_id: tg_id || null, username: username || null, days: days ?? null } }),
+  adminRevokePremium: ({ tg_id, username }) =>
+    req("/admin/premium", { method: "DELETE", body: { tg_id: tg_id || null, username: username || null } }),
+  geminiKeysStatus: () => req("/gemini/keys/status"),
 };
 
 export async function uploadImage(file) {
