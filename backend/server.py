@@ -102,6 +102,59 @@ MESSAGES_KEEP_AFTER_SUMMARY = 30
 COOLDOWN_SECONDS = 3
 LAST_REQUEST: Dict[int, float] = {}
 
+# ---------------- Anti-abuse (защита от спама и dodos) ----------------
+# Максимальная длина одного пользовательского сообщения (символов).
+# Обрезает атаки «пришлю мегабайт текста, чтобы съесть TPM».
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
+# Пер-юзер лимиты (по tg_id). Дневной сбрасывается в 00:00 UTC.
+PER_USER_HOURLY_LIMIT = int(os.environ.get("PER_USER_HOURLY_LIMIT", "20"))
+PER_USER_DAILY_LIMIT = int(os.environ.get("PER_USER_DAILY_LIMIT", "80"))
+# Не более одного активного стрима на юзера одновременно (защита от «10 вкладок»).
+_active_generations: set[int] = set()
+
+# ---------------- Admins & Premium ----------------
+# Админы задаются в .env одним или двумя списками (через запятую).
+# ADMIN_TG_USERNAMES: удобно, но юзер может сменить @username → менее безопасно.
+# ADMIN_TG_IDS: строго по числовому tg_id → безопаснее, рекомендуется.
+ADMIN_TG_USERNAMES = {
+    u.strip().lstrip("@").lower()
+    for u in os.environ.get("ADMIN_TG_USERNAMES", "").split(",") if u.strip()
+}
+ADMIN_TG_IDS = {
+    int(x.strip()) for x in os.environ.get("ADMIN_TG_IDS", "").split(",") if x.strip().isdigit()
+}
+
+
+def _is_admin(user_doc: Optional[Dict[str, Any]]) -> bool:
+    if not user_doc:
+        return False
+    if user_doc.get("tg_id") in ADMIN_TG_IDS:
+        return True
+    uname = (user_doc.get("username") or "").lstrip("@").lower()
+    return bool(uname and uname in ADMIN_TG_USERNAMES)
+
+
+def _is_premium(user_doc: Optional[Dict[str, Any]]) -> bool:
+    """Премиум если is_premium=True И (premium_until не задан ИЛИ ещё не истёк).
+    Админы автоматически считаются премиум."""
+    if not user_doc:
+        return False
+    if _is_admin(user_doc):
+        return True
+    if not user_doc.get("is_premium"):
+        return False
+    until = user_doc.get("premium_until")
+    if until is None:
+        return True  # бессрочный премиум
+    if isinstance(until, str):
+        try:
+            until = datetime.fromisoformat(until)
+        except ValueError:
+            return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return until > now_utc()
+
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
@@ -143,6 +196,14 @@ async def get_current_tg_id(creds: HTTPAuthorizationCredentials = Depends(bearer
     if not isinstance(tg_id, int):
         raise HTTPException(status_code=401, detail="Некорректный токен.")
     return tg_id
+
+
+async def require_admin(tg_id: int = Depends(get_current_tg_id)) -> Dict[str, Any]:
+    """Dep для админ-эндпоинтов. Возвращает user doc или 403."""
+    user = await db.users.find_one({"tg_id": tg_id})
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="Доступ запрещён.")
+    return user
 
 
 def verify_telegram_hash(data: Dict[str, Any]) -> bool:
@@ -244,9 +305,15 @@ class ChatRequest(BaseModel):
 
 
 def user_out(u: Dict[str, Any]) -> Dict[str, Any]:
+    premium_until = u.get("premium_until")
+    if isinstance(premium_until, datetime):
+        premium_until = premium_until.isoformat()
     return {"tg_id": u["tg_id"], "first_name": u.get("first_name"),
             "last_name": u.get("last_name"), "username": u.get("username"),
-            "photo_url": u.get("photo_url")}
+            "photo_url": u.get("photo_url"),
+            "is_admin": _is_admin(u),
+            "is_premium": _is_premium(u),
+            "premium_until": premium_until}
 
 
 def iso(v: Any) -> Optional[str]:
@@ -529,8 +596,11 @@ def _mark_key_cooldown(idx: int, retry_after: float, reason: str = "429") -> Non
     if not (0 <= idx < len(_key_states)):
         return
     now = asyncio.get_event_loop().time()
-    # Минимум 30 сек на всякий случай, максимум — что прислал Google (или 60 сек по умолчанию).
-    wait = max(retry_after, 30.0) if retry_after > 0 else 60.0
+    # Минимум 30 сек. Если Google не прислал retry_after — ставим 10 мин (обычно это RPD, ждать долго).
+    if retry_after > 0:
+        wait = max(retry_after, 30.0)
+    else:
+        wait = 600.0
     _key_states[idx]["cooldown_until"] = now + wait
     _key_states[idx]["fails"] += 1
     logger.info("Gemini key #%s put on cooldown for %.1fs (reason=%s, fails=%s)",
@@ -675,6 +745,66 @@ async def gemini_stream(model: str, history: List[Dict[str, Any]]):
     raise RuntimeError(last_err or "Не удалось получить ответ Gemini.")
 
 
+# ------------------------------------------------------------------ per-user quotas / anti-abuse
+def _period_keys() -> Tuple[str, str]:
+    """Возвращает (hour_key, day_key) в UTC для группировки счётчиков."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y%m%d%H"), now.strftime("%Y%m%d")
+
+
+async def _check_and_bump_user_quota(tg_id: int) -> None:
+    """
+    Атомарно инкрементит per-hour и per-day счётчики для tg_id.
+    Если после инкремента лимит превышен — откатывает и бросает 429.
+    Данные лежат в коллекции user_usage с TTL 48 часов (авто-очистка Mongo).
+    Premium-юзеры и админы обходят лимиты (никаких проверок).
+    """
+    # Premium/admin bypass — лимиты не применяются вообще.
+    user_doc = await db.users.find_one({"tg_id": tg_id})
+    if _is_premium(user_doc):
+        return
+
+    hour_key, day_key = _period_keys()
+    now = datetime.now(timezone.utc)
+
+    # Инкрементим оба счётчика (upsert)
+    await db.user_usage.update_one(
+        {"tg_id": tg_id, "period": day_key, "kind": "day"},
+        {"$inc": {"count": 1}, "$set": {"updated_at": now}},
+        upsert=True,
+    )
+    await db.user_usage.update_one(
+        {"tg_id": tg_id, "period": hour_key, "kind": "hour"},
+        {"$inc": {"count": 1}, "$set": {"updated_at": now}},
+        upsert=True,
+    )
+    # Читаем актуальные значения
+    day_doc = await db.user_usage.find_one({"tg_id": tg_id, "period": day_key, "kind": "day"})
+    hour_doc = await db.user_usage.find_one({"tg_id": tg_id, "period": hour_key, "kind": "hour"})
+    day_cnt = int((day_doc or {}).get("count", 0))
+    hour_cnt = int((hour_doc or {}).get("count", 0))
+
+    if hour_cnt > PER_USER_HOURLY_LIMIT:
+        # откатим инкремент, чтобы юзер не «сжигал» лимит впустую при повторах
+        await db.user_usage.update_one(
+            {"tg_id": tg_id, "period": hour_key, "kind": "hour"},
+            {"$inc": {"count": -1}},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=f"Слишком часто. Лимит {PER_USER_HOURLY_LIMIT} сообщений в час исчерпан. Попробуйте позже.",
+        )
+    if day_cnt > PER_USER_DAILY_LIMIT:
+        await db.user_usage.update_one(
+            {"tg_id": tg_id, "period": day_key, "kind": "day"},
+            {"$inc": {"count": -1}},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=f"Дневной лимит ({PER_USER_DAILY_LIMIT} сообщений) исчерпан. Возвращайтесь завтра.",
+        )
+
+
 async def _maybe_summarise(cid: str) -> None:
     """When a chat exceeds MESSAGES_SUMMARY_TRIGGER messages, ask the model to
     compress everything except the last MESSAGES_KEEP_AFTER_SUMMARY into
@@ -760,12 +890,39 @@ async def chat_stream(body: ChatRequest, request: Request, tg_id: int = Depends(
     if len(body.image_ids) > MAX_IMAGES_PER_MESSAGE:
         raise HTTPException(status_code=422, detail=f"Можно прикрепить максимум {MAX_IMAGES_PER_MESSAGE} изображения.")
 
-    # anti-spam cooldown (server-detected)
+    # Anti-abuse: ограничение длины одного сообщения (защита от «мегабайт текста» атак).
+    if len(body.content) > MAX_INPUT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Сообщение слишком длинное ({len(body.content)} симв.). Максимум {MAX_INPUT_CHARS}.",
+        )
+
+    # Anti-abuse: один активный стрим на юзера. Открыл 10 вкладок — работает одна.
+    if tg_id in _active_generations:
+        raise HTTPException(
+            status_code=429,
+            detail="Уже обрабатывается предыдущее сообщение. Дождитесь ответа.",
+        )
+
+    # Anti-spam cooldown (server-detected) — короткий кулдаун между сообщениями.
     last = LAST_REQUEST.get(tg_id, 0.0)
     wait = COOLDOWN_SECONDS - (now_utc().timestamp() - last)
     if wait > 0:
         raise HTTPException(status_code=429, detail=f"Слишком часто. Подождите {int(wait) + 1} сек.")
     LAST_REQUEST[tg_id] = now_utc().timestamp()
+
+    # Anti-abuse: часовой + дневной лимит по tg_id (в Mongo, персистентно).
+    await _check_and_bump_user_quota(tg_id)
+
+    # Fail-fast: если все ключи Gemini в кулдауне — не мучаем юзера ожиданием.
+    if _healthy_key_count() == 0:
+        # откатим только что засчитанный запрос — он ведь не выполнится
+        hk, dk = _period_keys()
+        await db.user_usage.update_one({"tg_id": tg_id, "period": hk, "kind": "hour"}, {"$inc": {"count": -1}})
+        await db.user_usage.update_one({"tg_id": tg_id, "period": dk, "kind": "day"}, {"$inc": {"count": -1}})
+        raise HTTPException(status_code=503, detail="Сервис временно перегружен. Попробуйте через минуту.")
+
+    _active_generations.add(tg_id)
 
     # validate referenced images (must belong to caller and still be alive)
     image_records: List[Dict[str, Any]] = []
@@ -834,31 +991,35 @@ async def chat_stream(body: ChatRequest, request: Request, tg_id: int = Depends(
                    for m in conv_full.get("messages", []))
 
     async def event_gen():
-        yield f"data: {json.dumps({'type': 'meta', 'conversation_id': cid, 'title': conv.get('title')})}\n\n"
-        collected: List[str] = []
         try:
-            async for delta in gemini_stream(body.model, history):
-                collected.append(delta)
-                yield f"data: {json.dumps({'type': 'delta', 'text': delta})}\n\n"
-        except RuntimeError as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-        except Exception:  # noqa: BLE001
-            logger.exception("stream failed")
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Ошибка генерации ответа.'})}\n\n"
-        full = "".join(collected)
-        if full:
-            done_at = now_utc()
-            asst_msg = {"role": "assistant", "content": full, "images": [],
-                        "model": body.model, "created_at": done_at}
-            await db.conversations.update_one(
-                {"_id": ObjectId(cid)},
-                {"$push": {"messages": asst_msg},
-                 "$inc": {"size_bytes": len(full.encode("utf-8")), "message_count": 1},
-                 "$set": {"updated_at": done_at, "model": body.model}},
-            )
-            # Storage-optimisation: compress old history into a summary once the chat gets long.
-            await _maybe_summarise(cid)
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            yield f"data: {json.dumps({'type': 'meta', 'conversation_id': cid, 'title': conv.get('title')})}\n\n"
+            collected: List[str] = []
+            try:
+                async for delta in gemini_stream(body.model, history):
+                    collected.append(delta)
+                    yield f"data: {json.dumps({'type': 'delta', 'text': delta})}\n\n"
+            except RuntimeError as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            except Exception:  # noqa: BLE001
+                logger.exception("stream failed")
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Ошибка генерации ответа.'})}\n\n"
+            full = "".join(collected)
+            if full:
+                done_at = now_utc()
+                asst_msg = {"role": "assistant", "content": full, "images": [],
+                            "model": body.model, "created_at": done_at}
+                await db.conversations.update_one(
+                    {"_id": ObjectId(cid)},
+                    {"$push": {"messages": asst_msg},
+                     "$inc": {"size_bytes": len(full.encode("utf-8")), "message_count": 1},
+                     "$set": {"updated_at": done_at, "model": body.model}},
+                )
+                # Storage-optimisation: compress old history into a summary once the chat gets long.
+                await _maybe_summarise(cid)
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        finally:
+            # Всегда освобождаем «слот» юзера, даже если клиент отвалился.
+            _active_generations.discard(tg_id)
 
     return StreamingResponse(event_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
@@ -889,6 +1050,126 @@ async def gemini_keys_status(tg_id: int = Depends(get_current_tg_id)):
     return {"total_keys": len(GEMINI_API_KEYS),
             "healthy_now": sum(1 for it in items if it["healthy"]),
             "keys": items}
+
+
+# ------------------------------------------------------------------ Admin panel
+class PremiumGrant(BaseModel):
+    tg_id: Optional[int] = None
+    username: Optional[str] = Field(None, max_length=64)
+    days: Optional[int] = Field(None, ge=1, le=3650)  # None = бессрочно
+
+
+class PremiumRevoke(BaseModel):
+    tg_id: Optional[int] = None
+    username: Optional[str] = Field(None, max_length=64)
+
+
+async def _find_user_by_ref(tg_id: Optional[int], username: Optional[str]) -> Optional[Dict[str, Any]]:
+    if tg_id:
+        u = await db.users.find_one({"tg_id": tg_id})
+        if u:
+            return u
+    if username:
+        uname = username.strip().lstrip("@").lower()
+        if uname:
+            # username в БД хранится как есть — сравниваем без учёта регистра через regex
+            return await db.users.find_one({"username": {"$regex": f"^{re.escape(uname)}$", "$options": "i"}})
+    return None
+
+
+def _admin_user_out(u: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "tg_id": u["tg_id"],
+        "first_name": u.get("first_name"),
+        "last_name": u.get("last_name"),
+        "username": u.get("username"),
+        "photo_url": u.get("photo_url"),
+        "is_admin": _is_admin(u),
+        "is_premium": _is_premium(u),
+        "premium_until": u["premium_until"].isoformat() if isinstance(u.get("premium_until"), datetime) else u.get("premium_until"),
+        "created_at": u["created_at"].isoformat() if isinstance(u.get("created_at"), datetime) else u.get("created_at"),
+        "last_login_at": u["last_login_at"].isoformat() if isinstance(u.get("last_login_at"), datetime) else u.get("last_login_at"),
+    }
+
+
+@api.get("/admin/users")
+async def admin_users_search(
+    query: str = "",
+    limit: int = 30,
+    _admin: Dict[str, Any] = Depends(require_admin),
+):
+    """Поиск юзеров: по @username (contains, case-insensitive) или по tg_id (точно)."""
+    limit = max(1, min(int(limit or 30), 100))
+    q = (query or "").strip().lstrip("@")
+    filt: Dict[str, Any] = {}
+    if q:
+        if q.isdigit():
+            filt = {"$or": [{"tg_id": int(q)},
+                            {"username": {"$regex": re.escape(q), "$options": "i"}}]}
+        else:
+            filt = {"$or": [{"username": {"$regex": re.escape(q), "$options": "i"}},
+                            {"first_name": {"$regex": re.escape(q), "$options": "i"}}]}
+    cur = db.users.find(filt).sort("last_login_at", -1).limit(limit)
+    return {"users": [_admin_user_out(u) async for u in cur]}
+
+
+@api.post("/admin/premium")
+async def admin_grant_premium(body: PremiumGrant,
+                              _admin: Dict[str, Any] = Depends(require_admin)):
+    """Выдать премиум: `days=None` = бессрочно, иначе `now + days`.
+    Идентификация юзера по tg_id или @username (регистронезависимо)."""
+    if not body.tg_id and not body.username:
+        raise HTTPException(status_code=422, detail="Укажите tg_id или username.")
+    user = await _find_user_by_ref(body.tg_id, body.username)
+    if not user:
+        raise HTTPException(status_code=404,
+                            detail="Пользователь не найден. Он должен хотя бы раз войти в приложение.")
+    until = None if body.days is None else now_utc() + timedelta(days=body.days)
+    await db.users.update_one(
+        {"tg_id": user["tg_id"]},
+        {"$set": {"is_premium": True, "premium_until": until}},
+    )
+    updated = await db.users.find_one({"tg_id": user["tg_id"]})
+    logger.info("Admin %s granted premium (days=%s) to tg_id=%s @%s",
+                _admin.get("tg_id"), body.days, user["tg_id"], user.get("username"))
+    return _admin_user_out(updated)
+
+
+@api.delete("/admin/premium")
+async def admin_revoke_premium(body: PremiumRevoke,
+                               _admin: Dict[str, Any] = Depends(require_admin)):
+    """Снять премиум."""
+    if not body.tg_id and not body.username:
+        raise HTTPException(status_code=422, detail="Укажите tg_id или username.")
+    user = await _find_user_by_ref(body.tg_id, body.username)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден.")
+    await db.users.update_one(
+        {"tg_id": user["tg_id"]},
+        {"$set": {"is_premium": False, "premium_until": None}},
+    )
+    updated = await db.users.find_one({"tg_id": user["tg_id"]})
+    logger.info("Admin %s revoked premium from tg_id=%s @%s",
+                _admin.get("tg_id"), user["tg_id"], user.get("username"))
+    return _admin_user_out(updated)
+
+
+@api.get("/admin/stats")
+async def admin_stats(_admin: Dict[str, Any] = Depends(require_admin)):
+    """Быстрая сводка для дашборда."""
+    total = await db.users.count_documents({})
+    premium = await db.users.count_documents({"is_premium": True})
+    now = now_utc()
+    active_24h = await db.users.count_documents({"last_login_at": {"$gte": now - timedelta(hours=24)}})
+    active_7d = await db.users.count_documents({"last_login_at": {"$gte": now - timedelta(days=7)}})
+    return {
+        "total_users": total,
+        "premium_users": premium,
+        "active_24h": active_24h,
+        "active_7d": active_7d,
+        "gemini_keys_total": len(GEMINI_API_KEYS),
+        "gemini_keys_healthy": _healthy_key_count(),
+    }
 
 
 app.include_router(api)
@@ -928,6 +1209,10 @@ async def _startup():
     # Images: TTL on absolute expire_at (Mongo removes when now >= expire_at)
     await db.chat_images.create_index("expire_at", expireAfterSeconds=0)
     await db.chat_images.create_index("tg_id")
+
+    # Per-user usage counters (anti-abuse): TTL 48h — старые счётчики автоудаляются.
+    await db.user_usage.create_index([("tg_id", 1), ("period", 1), ("kind", 1)], unique=True)
+    await db.user_usage.create_index("updated_at", expireAfterSeconds=48 * 60 * 60)
 
     # One-time cleanup: legacy split-messages collection is no longer used.
     try:
