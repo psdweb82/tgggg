@@ -1,0 +1,108 @@
+{
+  "theme": "dark",
+  "archetype": "Archetype 4 (Swiss & High-Contrast)",
+  "design_philosophy": "Functional beauty. Color exists only to guide action. Stark, objective, and clear. Zero distractions for pure AI interaction.",
+  "colors": {
+    "background": "#0A0A0A",
+    "surface": "#121212",
+    "surface_hover": "#1C1C1C",
+    "border": "rgba(255, 255, 255, 0.1)",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#A1A1AA",
+    "accent_primary": "#FFFFFF",
+    "accent_primary_foreground": "#000000",
+    "accent_secondary": "#27272A",
+    "user_bubble": "#1E1E1E",
+    "ai_bubble": "transparent"
+  },
+  "typography": {
+    "headings": {
+      "family": "Outfit, sans-serif",
+      "weight": "font-light",
+      "tracking": "tracking-tight"
+    },
+    "body": {
+      "family": "Inter, sans-serif",
+      "weight": "font-normal",
+      "line_height": "leading-relaxed"
+    },
+    "code": {
+      "family": "JetBrains Mono, monospace",
+      "size": "text-sm"
+    },
+    "scale": {
+      "h1": "text-4xl sm:text-5xl",
+      "h2": "text-2xl sm:text-3xl",
+      "h3": "text-xl sm:text-2xl",
+      "h4": "text-lg",
+      "body": "text-base",
+      "small": "text-sm"
+    }
+  },
+  "spacing_and_layout": {
+    "general": "Generous spacing. Use p-6, p-8 for containers. Generous line-height for chat messages.",
+    "chat_container": "max-w-3xl mx-auto w-full px-4 md:px-8 pt-24 pb-32",
+    "message_gap": "gap-8",
+    "sidebar_width": "w-72",
+    "composer": "fixed bottom-0 left-0 right-0 w-full md:pl-72 z-50 p-4 bg-gradient-to-t from-[#0A0A0A] via-[#0A0A0A]/90 to-transparent pointer-events-none"
+  },
+  "surfaces_and_borders": {
+    "composer_input": "Glassmorphism: bg-[#121212]/80 backdrop-blur-2xl border border-white/10 rounded-2xl p-2 pl-4 shadow-[0_8px_32px_rgba(0,0,0,0.5)] pointer-events-auto",
+    "sidebar": "Flat Solid: bg-[#050505] border-r border-white/5",
+    "dropdowns": "Neumorphism mix: bg-[#121212] border border-white/10 shadow-2xl rounded-xl",
+    "buttons": "Sharp corners or subtle 8px rounding. Primary buttons are pure white with black text."
+  },
+  "components": {
+    "TelegramLogin": {
+      "style": "Center screen on unauthenticated state. Minimalist wrapper, let the widget handle its native styling but wrap in a clean Card.",
+      "data_testid": "telegram-login-container"
+    },
+    "ChatThread": {
+      "style": "List of messages. AI messages have no background, just text. User messages are right-aligned or distinctly styled with a subtle dark grey bubble.",
+      "data_testid": "chat-thread"
+    },
+    "MessageBubble": {
+      "user": "bg-[#1E1E1E] border border-white/5 text-white px-5 py-3 rounded-2xl rounded-tr-sm max-w-[85%]",
+      "ai": "bg-transparent text-gray-200 py-3 w-full",
+      "data_testid": "message-bubble"
+    },
+    "ModelSelector": {
+      "style": "Use Shadcn Select. Minimal border, crisp text. Positioned top-left or top-center of the chat header.",
+      "data_testid": "model-selector"
+    },
+    "Composer": {
+      "style": "Textarea with auto-resize. Send button on the right (Icon only, pure white bg, black icon, rounded-xl).",
+      "data_testid": "chat-composer"
+    },
+    "HistorySidebar": {
+      "style": "List of recent chats. Hover state: bg-white/5. Active state: bg-white/10. Text truncate for long titles.",
+      "data_testid": "history-sidebar"
+    },
+    "CodeBlock": {
+      "style": "bg-[#050505] border border-white/10 rounded-xl overflow-hidden. Header bar with language and 'Copy' button.",
+      "data_testid": "code-block"
+    }
+  },
+  "motion_and_interactions": {
+    "hover": "Transition transform 0.2s ease, opacity 0.2s ease. Buttons lift slightly (-translate-y-[1px]).",
+    "focus": "focus:ring-2 focus:ring-white/20 focus:outline-none",
+    "message_entrance": "Staggered fade-in/slide-up for new messages."
+  },
+  "icons": {
+    "library": "lucide-react",
+    "style": "Stroke width 1.5. Clean, geometric."
+  },
+  "media": {
+    "image_urls": [],
+    "notes": "No external imagery required. Interface relies entirely on typography, negative space, and functional UI elements. Avatar loaded dynamically from Telegram."
+  },
+  "instructions_to_main_agent": [
+    "Ensure strict mobile responsiveness. The sidebar MUST be a hidden drawer (using Shadcn Sheet) on mobile, triggered by a hamburger menu.",
+    "Chat composer must sit securely above the mobile safe-area keyboard.",
+    "Do NOT use pure black (#000000), stick to the #0A0A0A base.",
+    "Use Outfit for main titles/brand and Inter for chat readability.",
+    "All interactive elements MUST have the specified data-testid.",
+    "Code blocks in markdown must be styled beautifully with syntax highlighting and a copy button.",
+    "Use Shadcn UI components extensively but strip away unnecessary styles to match the stark, minimal aesthetic."
+  ]
+}
