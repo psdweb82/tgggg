@@ -3,12 +3,13 @@ import re
 import json
 import hmac
 import uuid
+import asyncio
 import hashlib
 import logging
 from pathlib import Path
 from urllib.parse import parse_qsl
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import httpx
 import jwt
@@ -35,7 +36,14 @@ logger = logging.getLogger("ai_workspace")
 # ------------------------------------------------------------------ config
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# GEMINI_API_KEY может быть одним ключом или несколькими через запятую:
+#   GEMINI_API_KEY="AQ.key1,AQ.key2,AQ.key3"
+# Сервер ротирует их по кругу и при 429 автоматически переключается на следующий.
+_GEMINI_RAW = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEYS: List[str] = [k.strip() for k in _GEMINI_RAW.split(",") if k.strip()]
+GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""  # оставлено для совместимости
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-prod")
@@ -45,6 +53,20 @@ DEV_LOGIN_SECRET = os.environ.get("DEV_LOGIN_SECRET", "")
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# ---------------- Gemini call-safety knobs ----------------
+# Мин. интервал между вызовами Gemini API на весь инстанс (сек).
+# 15 RPM = 1 запрос каждые 4 сек. Ставим 4.0, чтобы физически не превысить квоту free-tier.
+GEMINI_MIN_INTERVAL_SEC = float(os.environ.get("GEMINI_MIN_INTERVAL_SEC", "4.0"))
+# Максимум секунд, которые сервер готов сам подождать при 429 перед retry.
+# Если Google просит подождать больше — переключаемся на следующий ключ / отдаём ошибку.
+GEMINI_MAX_WAIT_ON_429 = float(os.environ.get("GEMINI_MAX_WAIT_ON_429", "15.0"))
+# Максимум попыток на один запрос (перебираем ключи + повторяем текущий с ожиданием).
+GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "6"))
+
+_gemini_gate = asyncio.Lock()          # сериализует старты запросов к Gemini
+_gemini_last_call_ts: float = 0.0      # монотонное время последнего старта
+_gemini_key_idx: int = 0               # индекс round-robin для ключей
 
 # Only Flash-Lite is currently available on the free tier — expose it as "Gemini".
 AVAILABLE_MODELS = [
@@ -443,6 +465,48 @@ def _friendly_error(status_code: int, body: str) -> str:
     return f"Ошибка Gemini API ({status_code})."
 
 
+_RETRY_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
+
+
+def _parse_retry_after(body: str, headers: Dict[str, str] | None = None) -> float:
+    """Извлекает рекомендованную задержку из тела ошибки Gemini или заголовков."""
+    if headers:
+        ra = headers.get("retry-after") or headers.get("Retry-After")
+        if ra:
+            try:
+                return float(ra)
+            except ValueError:
+                pass
+    m = _RETRY_RE.search(body or "")
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return 0.0
+
+
+async def _gemini_throttle() -> None:
+    """Глобальный минимальный интервал между стартами вызовов Gemini на инстанс."""
+    global _gemini_last_call_ts
+    async with _gemini_gate:
+        now = asyncio.get_event_loop().time()
+        wait = GEMINI_MIN_INTERVAL_SEC - (now - _gemini_last_call_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _gemini_last_call_ts = asyncio.get_event_loop().time()
+
+
+def _next_key() -> Tuple[str, int]:
+    """Round-robin по списку ключей. Возвращает (ключ, его индекс)."""
+    global _gemini_key_idx
+    if not GEMINI_API_KEYS:
+        return "", -1
+    idx = _gemini_key_idx % len(GEMINI_API_KEYS)
+    _gemini_key_idx = (_gemini_key_idx + 1) % max(len(GEMINI_API_KEYS), 1)
+    return GEMINI_API_KEYS[idx], idx
+
+
 def _msg_parts_for_gemini(m: Dict[str, Any],
                           image_blobs: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build 'parts' array for a stored message when talking to Gemini."""
@@ -461,33 +525,89 @@ def _msg_parts_for_gemini(m: Dict[str, Any],
 
 
 async def gemini_stream(model: str, history: List[Dict[str, Any]]):
+    """
+    Стримит ответ Gemini с:
+      • глобальным throttle (>=GEMINI_MIN_INTERVAL_SEC между стартами),
+      • round-robin ротацией нескольких API-ключей,
+      • авто-retry при 429: если Google просит подождать <= GEMINI_MAX_WAIT_ON_429 сек — ждём и повторяем;
+        иначе — переключаемся на следующий ключ. До GEMINI_MAX_ATTEMPTS попыток на запрос.
+    """
+    if not GEMINI_API_KEYS:
+        raise RuntimeError("GEMINI_API_KEY не настроен на сервере.")
+
     url = f"{GEMINI_BASE}/{model}:streamGenerateContent?alt=sse"
     body = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": history,
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192},
     }
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as hc:
-        async with hc.stream("POST", url, headers=headers, json=body) as resp:
-            if resp.status_code != 200:
-                detail = (await resp.aread()).decode("utf-8", "ignore")[:800]
-                logger.error("Gemini error %s: %s", resp.status_code, detail)
-                raise RuntimeError(_friendly_error(resp.status_code, detail))
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                chunk = line[5:].strip()
-                if chunk == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(chunk)
-                except json.JSONDecodeError:
-                    continue
-                for cand in obj.get("candidates", []):
-                    for part in cand.get("content", {}).get("parts", []):
-                        if part.get("text"):
-                            yield part["text"]
+
+    last_err: Optional[str] = None
+    tried_keys: set[int] = set()
+
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        await _gemini_throttle()
+        key, key_idx = _next_key()
+        tried_keys.add(key_idx)
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as hc:
+                async with hc.stream("POST", url, headers=headers, json=body) as resp:
+                    if resp.status_code == 200:
+                        async for line in resp.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            chunk = line[5:].strip()
+                            if chunk == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(chunk)
+                            except json.JSONDecodeError:
+                                continue
+                            for cand in obj.get("candidates", []):
+                                for part in cand.get("content", {}).get("parts", []):
+                                    if part.get("text"):
+                                        yield part["text"]
+                        return  # успех
+
+                    # не-200: читаем тело и решаем, что делать
+                    detail = (await resp.aread()).decode("utf-8", "ignore")[:800]
+                    logger.error("Gemini error %s (key #%s, attempt %s/%s): %s",
+                                 resp.status_code, key_idx, attempt, GEMINI_MAX_ATTEMPTS, detail)
+                    last_err = _friendly_error(resp.status_code, detail)
+
+                    if resp.status_code == 429:
+                        retry_sec = _parse_retry_after(detail, dict(resp.headers))
+                        # Если есть другие непопробованные ключи — сразу переключаемся.
+                        if len(tried_keys) < len(GEMINI_API_KEYS):
+                            continue
+                        # Один ключ или все ключи исчерпаны: ждём, если недолго.
+                        if 0 < retry_sec <= GEMINI_MAX_WAIT_ON_429:
+                            logger.info("Gemini 429: waiting %.1fs before retry", retry_sec + 0.3)
+                            await asyncio.sleep(retry_sec + 0.3)
+                            tried_keys.clear()  # даём ключам ещё шанс после ожидания
+                            continue
+                        # Слишком долго ждать — отдаём человекочитаемую ошибку.
+                        if retry_sec > 0:
+                            last_err = (f"Лимит free-tier исчерпан. "
+                                        f"Попробуйте снова через ~{int(retry_sec)} сек "
+                                        f"или добавьте ещё один ключ в GEMINI_API_KEY (через запятую).")
+                        raise RuntimeError(last_err)
+
+                    if resp.status_code >= 500:
+                        # временная ошибка сервера — короткий бэкофф и повтор
+                        await asyncio.sleep(min(2.0 * attempt, 6.0))
+                        continue
+
+                    # 4xx кроме 429 — не ретраим
+                    raise RuntimeError(last_err)
+        except httpx.HTTPError as e:
+            logger.warning("Gemini network error (attempt %s): %s", attempt, e)
+            last_err = "Сеть недоступна. Попробуйте ещё раз."
+            await asyncio.sleep(min(1.5 * attempt, 5.0))
+            continue
+
+    raise RuntimeError(last_err or "Не удалось получить ответ Gemini.")
 
 
 async def _maybe_summarise(cid: str) -> None:
@@ -518,9 +638,13 @@ async def _maybe_summarise(cid: str) -> None:
     }
     summary_text = previous_summary
     try:
+        await _gemini_throttle()
+        key, _idx = _next_key()
+        if not key:
+            raise RuntimeError("no gemini key")
         async with httpx.AsyncClient(timeout=60.0) as hc:
             r = await hc.post(f"{GEMINI_BASE}/{DEFAULT_MODEL}:generateContent",
-                              headers={"x-goog-api-key": GEMINI_API_KEY,
+                              headers={"x-goog-api-key": key,
                                        "Content-Type": "application/json"},
                               json=request)
             if r.status_code == 200:
@@ -560,7 +684,7 @@ async def _maybe_summarise(cid: str) -> None:
 @api.post("/chat/stream")
 @limiter.limit("30/minute")
 async def chat_stream(body: ChatRequest, request: Request, tg_id: int = Depends(get_current_tg_id)):
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEYS:
         raise HTTPException(status_code=503, detail="GEMINI_API_KEY не настроен на сервере.")
     if not body.content.strip() and not body.image_ids:
         raise HTTPException(status_code=422, detail="Пустой запрос.")
