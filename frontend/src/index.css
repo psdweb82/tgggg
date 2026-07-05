@@ -1,0 +1,119 @@
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 6% 4%;
+    --foreground: 0 0% 100%;
+    --card: 240 5% 7%;
+    --card-foreground: 0 0% 100%;
+    --popover: 240 5% 7%;
+    --popover-foreground: 0 0% 100%;
+    --primary: 0 0% 100%;
+    --primary-foreground: 0 0% 0%;
+    --secondary: 240 4% 16%;
+    --secondary-foreground: 0 0% 100%;
+    --muted: 0 0% 11%;
+    --muted-foreground: 240 5% 65%;
+    --accent: 0 0% 11%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 15%;
+    --input: 0 0% 15%;
+    --ring: 0 0% 45%;
+    --radius: 0.75rem;
+  }
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: #070708;
+  color: #fff;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior-y: none;
+}
+
+.font-display { font-family: 'Instrument Sans', 'Outfit', sans-serif; letter-spacing: -0.02em; }
+.font-mono { font-family: 'JetBrains Mono', monospace; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+::selection { background: rgba(255,255,255,0.18); color: #fff; }
+
+/* Streaming tail: last chars smoothly fade & slide in */
+@keyframes tail-in {
+  from { opacity: 0.15; filter: blur(3px); }
+  to   { opacity: 1;    filter: blur(0);   }
+}
+.stream-tail {
+  display: inline;
+  animation: tail-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  color: rgba(255,255,255,0.92);
+}
+
+/* Thinking dots */
+@keyframes think-bounce {
+  0%, 80%, 100% { opacity: 0.2; transform: translateY(0) scale(0.9); }
+  40%           { opacity: 1;   transform: translateY(-3px) scale(1); }
+}
+.thinking-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.75);
+  animation: think-bounce 1.2s ease-in-out infinite;
+}
+
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-msg-in { animation: msg-in 0.35s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.2; } }
+.cursor-blink { animation: blink 1s step-end infinite; }
+
+/* Markdown */
+.md-body { line-height: 1.72; font-size: 0.975rem; word-break: break-word; color: rgba(255,255,255,0.92); }
+.md-body p { margin: 0.55rem 0; }
+.md-body p:first-child { margin-top: 0; }
+.md-body p:last-child { margin-bottom: 0; }
+.md-body h1,.md-body h2,.md-body h3 { font-family: 'Instrument Sans', sans-serif; font-weight: 600; margin: 1.1rem 0 0.5rem; line-height: 1.25; letter-spacing: -0.01em; }
+.md-body h1 { font-size: 1.5rem; } .md-body h2 { font-size: 1.28rem; } .md-body h3 { font-size: 1.1rem; }
+.md-body ul,.md-body ol { margin: 0.5rem 0; padding-left: 1.4rem; }
+.md-body li { margin: 0.25rem 0; }
+.md-body strong { color: #fff; font-weight: 600; }
+.md-body a { color: #fff; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgba(255,255,255,0.35); }
+.md-body a:hover { text-decoration-color: #fff; }
+.md-body blockquote { border-left: 2px solid rgba(255,255,255,0.2); padding-left: 1rem; color: rgba(255,255,255,0.6); margin: 0.7rem 0; }
+.md-body :not(pre) > code { background: rgba(255,255,255,0.08); padding: 0.15em 0.42em; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 0.85em; color: #fff; }
+.md-body table { width: 100%; border-collapse: collapse; margin: 0.8rem 0; font-size: 0.9rem; }
+.md-body th,.md-body td { border: 1px solid rgba(255,255,255,0.12); padding: 0.5rem 0.7rem; text-align: left; }
+.md-body th { background: rgba(255,255,255,0.05); font-weight: 600; }
+.md-body hr { border: 0; height: 1px; background: rgba(255,255,255,0.1); margin: 1.2rem 0; }
+
+/* Mobile safe-areas + tap tuning */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .fixed.bottom-0 { padding-bottom: env(safe-area-inset-bottom); }
+}
+
+@media (max-width: 640px) {
+  .md-body { font-size: 0.94rem; }
+}
