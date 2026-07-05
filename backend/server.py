@@ -3,6 +3,7 @@ import re
 import json
 import hmac
 import uuid
+import random
 import asyncio
 import hashlib
 import logging
@@ -66,7 +67,12 @@ GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "6"))
 
 _gemini_gate = asyncio.Lock()          # сериализует старты запросов к Gemini
 _gemini_last_call_ts: float = 0.0      # монотонное время последнего старта
-_gemini_key_idx: int = 0               # индекс round-robin для ключей
+
+# Per-key состояние: {"cooldown_until": <monotonic sec>, "fails": <int>, "last_used": <ts>}
+# cooldown_until > loop.time() ⇒ ключ временно исключён из выбора (после 429/403).
+_key_states: List[Dict[str, Any]] = [
+    {"cooldown_until": 0.0, "fails": 0, "last_used": 0.0} for _ in GEMINI_API_KEYS
+]
 
 # Only Flash-Lite is currently available on the free tier — expose it as "Gemini".
 AVAILABLE_MODELS = [
@@ -497,14 +503,49 @@ async def _gemini_throttle() -> None:
         _gemini_last_call_ts = asyncio.get_event_loop().time()
 
 
-def _next_key() -> Tuple[str, int]:
-    """Round-robin по списку ключей. Возвращает (ключ, его индекс)."""
-    global _gemini_key_idx
+def _pick_key() -> Tuple[str, int, float]:
+    """
+    Возвращает (key, idx, wait_sec).
+    Выбирает СЛУЧАЙНЫЙ ключ среди «здоровых» (у которых cooldown_until <= now).
+    Если все на кулдауне — берёт ключ с ближайшим окончанием кулдауна и говорит,
+    сколько нужно подождать (wait_sec > 0).
+    """
     if not GEMINI_API_KEYS:
-        return "", -1
-    idx = _gemini_key_idx % len(GEMINI_API_KEYS)
-    _gemini_key_idx = (_gemini_key_idx + 1) % max(len(GEMINI_API_KEYS), 1)
-    return GEMINI_API_KEYS[idx], idx
+        return "", -1, 0.0
+    now = asyncio.get_event_loop().time()
+    available = [i for i, s in enumerate(_key_states) if s["cooldown_until"] <= now]
+    if available:
+        idx = random.choice(available)
+        wait = 0.0
+    else:
+        idx = min(range(len(_key_states)),
+                  key=lambda i: _key_states[i]["cooldown_until"])
+        wait = max(0.0, _key_states[idx]["cooldown_until"] - now)
+    _key_states[idx]["last_used"] = now
+    return GEMINI_API_KEYS[idx], idx, wait
+
+
+def _mark_key_cooldown(idx: int, retry_after: float, reason: str = "429") -> None:
+    if not (0 <= idx < len(_key_states)):
+        return
+    now = asyncio.get_event_loop().time()
+    # Минимум 30 сек на всякий случай, максимум — что прислал Google (или 60 сек по умолчанию).
+    wait = max(retry_after, 30.0) if retry_after > 0 else 60.0
+    _key_states[idx]["cooldown_until"] = now + wait
+    _key_states[idx]["fails"] += 1
+    logger.info("Gemini key #%s put on cooldown for %.1fs (reason=%s, fails=%s)",
+                idx, wait, reason, _key_states[idx]["fails"])
+
+
+def _mark_key_ok(idx: int) -> None:
+    if 0 <= idx < len(_key_states):
+        _key_states[idx]["cooldown_until"] = 0.0
+        _key_states[idx]["fails"] = 0
+
+
+def _healthy_key_count() -> int:
+    now = asyncio.get_event_loop().time()
+    return sum(1 for s in _key_states if s["cooldown_until"] <= now)
 
 
 def _msg_parts_for_gemini(m: Dict[str, Any],
@@ -543,17 +584,36 @@ async def gemini_stream(model: str, history: List[Dict[str, Any]]):
     }
 
     last_err: Optional[str] = None
-    tried_keys: set[int] = set()
+    tried_in_this_request: set[int] = set()
 
     for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
         await _gemini_throttle()
-        key, key_idx = _next_key()
-        tried_keys.add(key_idx)
+        key, key_idx, wait_needed = _pick_key()
+
+        # Все ключи в кулдауне: возможно недолго подождать и попробовать снова.
+        if wait_needed > 0:
+            if wait_needed <= GEMINI_MAX_WAIT_ON_429 and attempt < GEMINI_MAX_ATTEMPTS:
+                logger.info("All keys on cooldown, sleeping %.1fs", wait_needed + 0.3)
+                await asyncio.sleep(wait_needed + 0.3)
+                tried_in_this_request.clear()
+                # после сна ключ уже «здоров», возьмём его следующим кругом
+                continue
+            last_err = (f"Сервис временно перегружен. "
+                        f"Повторите через ~{int(wait_needed)} сек.")
+            raise RuntimeError(last_err)
+
+        # В рамках одного запроса не долбим один и тот же ключ повторно, если ключей >= 2.
+        if key_idx in tried_in_this_request and _healthy_key_count() > 0:
+            # даём _pick_key ещё шанс на другом ключе
+            continue
+        tried_in_this_request.add(key_idx)
+
         headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as hc:
                 async with hc.stream("POST", url, headers=headers, json=body) as resp:
                     if resp.status_code == 200:
+                        _mark_key_ok(key_idx)
                         async for line in resp.aiter_lines():
                             if not line or not line.startswith("data:"):
                                 continue
@@ -578,28 +638,33 @@ async def gemini_stream(model: str, history: List[Dict[str, Any]]):
 
                     if resp.status_code == 429:
                         retry_sec = _parse_retry_after(detail, dict(resp.headers))
-                        # Если есть другие непопробованные ключи — сразу переключаемся.
-                        if len(tried_keys) < len(GEMINI_API_KEYS):
+                        _mark_key_cooldown(key_idx, retry_sec, reason="429")
+                        # есть другие живые ключи → сразу свитч
+                        if _healthy_key_count() > 0:
                             continue
-                        # Один ключ или все ключи исчерпаны: ждём, если недолго.
+                        # все на кулдауне: короткий retry-loop, если ждать недолго
                         if 0 < retry_sec <= GEMINI_MAX_WAIT_ON_429:
-                            logger.info("Gemini 429: waiting %.1fs before retry", retry_sec + 0.3)
+                            logger.info("All keys exhausted, waiting %.1fs", retry_sec + 0.3)
                             await asyncio.sleep(retry_sec + 0.3)
-                            tried_keys.clear()  # даём ключам ещё шанс после ожидания
+                            tried_in_this_request.clear()
                             continue
-                        # Слишком долго ждать — отдаём человекочитаемую ошибку.
                         if retry_sec > 0:
-                            last_err = (f"Лимит free-tier исчерпан. "
-                                        f"Попробуйте снова через ~{int(retry_sec)} сек "
-                                        f"или добавьте ещё один ключ в GEMINI_API_KEY (через запятую).")
+                            last_err = (f"Сервис временно перегружен. "
+                                        f"Повторите через ~{int(retry_sec)} сек.")
+                        raise RuntimeError(last_err)
+
+                    if resp.status_code in (401, 403):
+                        # ключ реально плохой (отозван/не имеет доступа) — надолго в бан
+                        _mark_key_cooldown(key_idx, 3600.0, reason=f"http-{resp.status_code}")
+                        if _healthy_key_count() > 0:
+                            continue
                         raise RuntimeError(last_err)
 
                     if resp.status_code >= 500:
-                        # временная ошибка сервера — короткий бэкофф и повтор
                         await asyncio.sleep(min(2.0 * attempt, 6.0))
                         continue
 
-                    # 4xx кроме 429 — не ретраим
+                    # 4xx кроме перечисленных — не ретраим
                     raise RuntimeError(last_err)
         except httpx.HTTPError as e:
             logger.warning("Gemini network error (attempt %s): %s", attempt, e)
@@ -639,20 +704,24 @@ async def _maybe_summarise(cid: str) -> None:
     summary_text = previous_summary
     try:
         await _gemini_throttle()
-        key, _idx = _next_key()
-        if not key:
-            raise RuntimeError("no gemini key")
+        key, key_idx, wait_needed = _pick_key()
+        if not key or wait_needed > 0:
+            # все ключи на кулдауне — просто пропускаем фоновую суммаризацию
+            raise RuntimeError("no healthy gemini key for summary")
         async with httpx.AsyncClient(timeout=60.0) as hc:
             r = await hc.post(f"{GEMINI_BASE}/{DEFAULT_MODEL}:generateContent",
                               headers={"x-goog-api-key": key,
                                        "Content-Type": "application/json"},
                               json=request)
             if r.status_code == 200:
+                _mark_key_ok(key_idx)
                 data = r.json()
                 parts = ((data.get("candidates") or [{}])[0]
                          .get("content", {}).get("parts", []))
                 summary_text = "".join(p.get("text", "") for p in parts).strip() or previous_summary
             else:
+                if r.status_code == 429:
+                    _mark_key_cooldown(key_idx, _parse_retry_after(r.text, dict(r.headers)), "429-summary")
                 logger.warning("summary call failed: %s %s", r.status_code, r.text[:200])
     except Exception as e:  # noqa: BLE001
         logger.warning("summary error: %s", e)
@@ -799,6 +868,27 @@ async def chat_stream(body: ChatRequest, request: Request, tg_id: int = Depends(
 @api.get("/")
 async def root():
     return {"message": "AI Workspace API", "status": "ok"}
+
+
+@api.get("/gemini/keys/status")
+async def gemini_keys_status(tg_id: int = Depends(get_current_tg_id)):
+    """Диагностика: сколько ключей загружено, кто на кулдауне и сколько осталось ждать.
+    Сами ключи не отдаём — только последние 4 символа."""
+    now = asyncio.get_event_loop().time()
+    items = []
+    for i, s in enumerate(_key_states):
+        remaining = max(0.0, s["cooldown_until"] - now)
+        k = GEMINI_API_KEYS[i] if i < len(GEMINI_API_KEYS) else ""
+        items.append({
+            "idx": i,
+            "tail": k[-4:] if k else "",
+            "healthy": remaining <= 0,
+            "cooldown_remaining_sec": round(remaining, 1),
+            "fails_total": s["fails"],
+        })
+    return {"total_keys": len(GEMINI_API_KEYS),
+            "healthy_now": sum(1 for it in items if it["healthy"]),
+            "keys": items}
 
 
 app.include_router(api)
