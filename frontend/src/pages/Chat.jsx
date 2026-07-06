@@ -10,6 +10,7 @@ import ModelSelector from "@/components/ModelSelector";
 import MessageContent from "@/components/MessageContent";
 import ErrorBlock from "@/components/ErrorBlock";
 import GeneratedImage from "@/components/GeneratedImage";
+import IntroSplash from "@/components/IntroSplash";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 
 const SUGGESTIONS = [
@@ -35,6 +36,9 @@ export default function Chat() {
   const [streaming, setStreaming] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [attachments, setAttachments] = useState([]);        // [{ file?, previewUrl, uploading, id?, mime?, error?, size }]
+  const [usage, setUsage] = useState(null);
+  const [cooldownLeft, setCooldownLeft] = useState(0);       // сек до разблокировки
+  const [showIntro, setShowIntro] = useState(() => !sessionStorage.getItem("aiw_intro_shown"));
   const scrollRef = useRef(null);
   const stopRef = useRef(false);
   const controllerRef = useRef(null);
@@ -45,6 +49,31 @@ export default function Chat() {
 
   const activeLocked = !!activeConv?.locked;
 
+  const fmtTimer = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  const cooldownActive = !!usage?.blocked && cooldownLeft > 0;
+  const cooldownLabel = fmtTimer(cooldownLeft);
+
+  const fetchUsage = useCallback(async () => {
+    try {
+      const u = await api.usageStatus();
+      setUsage(u);
+    } catch { /* ignore */ }
+  }, []);
+
+  // Обратный отсчёт по абсолютному retry_at (устойчив к перезагрузке/сну процесса).
+  useEffect(() => {
+    if (!usage?.blocked || !usage?.retry_at) { setCooldownLeft(0); return; }
+    const target = new Date(usage.retry_at).getTime();
+    const tick = () => {
+      const left = Math.max(0, Math.round((target - Date.now()) / 1000));
+      setCooldownLeft(left);
+      if (left <= 0) fetchUsage();   // окно освободилось — авто-разблокировка без перезагрузки
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [usage, fetchUsage]);
+
   const scrollToBottom = useCallback((behavior = "smooth") => {
     requestAnimationFrame(() => {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior });
@@ -54,6 +83,7 @@ export default function Chat() {
   useEffect(() => {
     api.models().then((d) => setModels(d.models)).catch(() => {});
     refreshConversations();
+    fetchUsage();
   }, []);
 
   useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
@@ -101,7 +131,14 @@ export default function Chat() {
       setConversations((cs) => cs.filter((c) => c.id !== id));
       if (activeId === id) newChat();
       toast.success("Чат удалён — лимит на 5 чатов восстановлен");
-    } catch {
+    } catch (e) {
+      // На мобильных (Android) событие может сработать дважды: первый DELETE успешен,
+      // второй возвращает 404. Это НЕ ошибка — чат уже удалён, просто чистим стейт.
+      if (e?.status === 404) {
+        setConversations((cs) => cs.filter((c) => c.id !== id));
+        if (activeId === id) newChat();
+        return;
+      }
       toast.error("Не удалось удалить");
     }
   };
@@ -150,6 +187,7 @@ export default function Chat() {
     if (!opts.retry && !content && usableAttachments.length === 0) return;
     if (streaming) return;
     if (activeLocked) { toast.error("Чат заблокирован. Удалите его, чтобы продолжить."); return; }
+    if (cooldownActive) { toast.error(`Лимит исчерпан. Подождите ${cooldownLabel}.`); return; }
 
     const attachmentsToSend = opts.retry
       ? (lastSendRef.current?.attachments || [])
@@ -240,6 +278,7 @@ export default function Chat() {
     controllerRef.current = null;
     if (!activeId && convId) setActiveId(convId);
     refreshConversations();
+    fetchUsage();
   };
 
   const stop = () => {
@@ -255,6 +294,14 @@ export default function Chat() {
 
   return (
     <div className="h-full w-full text-white flex overflow-hidden relative">
+      <AnimatePresence>
+        {showIntro && (
+          <IntroSplash
+            key="intro"
+            onDone={() => { sessionStorage.setItem("aiw_intro_shown", "1"); setShowIntro(false); }}
+          />
+        )}
+      </AnimatePresence>
       <div className="pointer-events-none absolute inset-0 -z-10 bg-[#070708]">
         <div className="absolute top-[-20%] left-1/2 -translate-x-1/2 h-[540px] w-[540px] rounded-full bg-white/[0.04] blur-[120px]" />
         <div className="absolute bottom-[-30%] right-[-10%] h-[420px] w-[420px] rounded-full bg-[#4a3ce6]/[0.10] blur-[140px]" />
@@ -281,6 +328,22 @@ export default function Chat() {
               </Sheet>
               {models.length > 0 && <ModelSelector models={models} value={model} onChange={setModel} />}
               <div className="flex-1" />
+              {usage && !usage.unlimited && (
+                <span
+                  data-testid="requests-remaining"
+                  title="Осталось запросов в текущем часовом окне"
+                  className={`inline-flex items-center gap-1.5 text-[11px] font-mono rounded-full border px-2.5 py-1 ${
+                    usage.hourly_remaining <= 0
+                      ? "border-red-500/30 bg-red-500/10 text-red-300"
+                      : usage.hourly_remaining <= 3
+                      ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                      : "border-white/10 bg-white/[0.04] text-white/60"
+                  }`}
+                >
+                  <Zap className="h-3.5 w-3.5" strokeWidth={2} />
+                  {usage.hourly_remaining}/{usage.hourly_limit}
+                </span>
+              )}
               {activeLocked && (
                 <span data-testid="header-lock" className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-amber-300/80 font-mono">
                   <Lock className="h-3.5 w-3.5" /> ЗАБЛОКИРОВАН
@@ -400,6 +463,8 @@ export default function Chat() {
           onPickFiles={handlePickFiles}
           onRemoveAttachment={removeAttachment}
           locked={activeLocked}
+          cooldownActive={cooldownActive}
+          cooldownLabel={cooldownLabel}
           lockedHint={activeLocked
             ? `Чат «${activeConv?.title || ''}» занимает ~${((activeConv?.size_bytes || 0) / (1024*1024)).toFixed(1)} МБ (> 150 МБ). Скопируйте нужное и удалите его, чтобы разблокировать лимит на 5 чатов.`
             : ""}
