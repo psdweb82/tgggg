@@ -25,7 +25,7 @@ const REVEAL_CATCHUP = 8;
 const REVEAL_FADE_TAIL = 24;
 
 export default function Chat() {
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const [models, setModels] = useState([]);
   const [model, setModel] = useState("gemini-2.5-flash-lite");
   const [conversations, setConversations] = useState([]);
@@ -58,7 +58,8 @@ export default function Chat() {
       const u = await api.usageStatus();
       setUsage(u);
     } catch { /* ignore */ }
-  }, []);
+    refreshUser?.();   // подтягиваем актуальный тариф (Luxury/Free) без перезахода
+  }, [refreshUser]);
 
   // Обратный отсчёт по абсолютному retry_at (устойчив к перезагрузке/сну процесса).
   useEffect(() => {
@@ -84,6 +85,9 @@ export default function Chat() {
     api.models().then((d) => setModels(d.models)).catch(() => {});
     refreshConversations();
     fetchUsage();
+    // Лёгкий поллинг: подхватываем изменение тарифа/лимитов (напр. выдачу Luxury) без перезахода.
+    const id = setInterval(fetchUsage, 20000);
+    return () => clearInterval(id);
   }, []);
 
   useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
