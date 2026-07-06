@@ -2,8 +2,8 @@ import os
 import re
 import json
 import hmac
+import time
 import uuid
-import random
 import asyncio
 import hashlib
 import logging
@@ -27,6 +27,8 @@ from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+
+from key_manager import GeminiKeyManager, classify_error, parse_retry_after
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -56,23 +58,27 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # ---------------- Gemini call-safety knobs ----------------
-# Мин. интервал между вызовами Gemini API на весь инстанс (сек).
-# 15 RPM = 1 запрос каждые 4 сек. Ставим 4.0, чтобы физически не превысить квоту free-tier.
-GEMINI_MIN_INTERVAL_SEC = float(os.environ.get("GEMINI_MIN_INTERVAL_SEC", "4.0"))
-# Максимум секунд, которые сервер готов сам подождать при 429 перед retry.
-# Если Google просит подождать больше — переключаемся на следующий ключ / отдаём ошибку.
-GEMINI_MAX_WAIT_ON_429 = float(os.environ.get("GEMINI_MAX_WAIT_ON_429", "15.0"))
-# Максимум попыток на один запрос (перебираем ключи + повторяем текущий с ожиданием).
-GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "6"))
+# Индивидуальный лимит RPM на КАЖДЫЙ ключ (free-tier ≈ 15 RPM). Глобального троттлинга нет —
+# нагрузка распределяется round-robin между всеми ключами через KeyManager.
+GEMINI_RPM_PER_KEY = int(os.environ.get("GEMINI_RPM_PER_KEY", "15"))
+# Максимум секунд, которые сервер готов сам подождать доступности ключа перед retry.
+GEMINI_MAX_WAIT = float(os.environ.get("GEMINI_MAX_WAIT", "8.0"))
+# Максимум попыток (перебор ключей + короткие ожидания) на один запрос.
+GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "8"))
+# Минимальный кулдаун ключа при 429 без Retry-After (сек).
+GEMINI_MIN_COOLDOWN = float(os.environ.get("GEMINI_MIN_COOLDOWN", "30.0"))
 
-_gemini_gate = asyncio.Lock()          # сериализует старты запросов к Gemini
-_gemini_last_call_ts: float = 0.0      # монотонное время последнего старта
+# Единый менеджер жизненного цикла ключей. Никакая другая часть кода не трогает
+# состояние ключей напрямую — только через методы key_manager.
+key_manager = GeminiKeyManager(
+    GEMINI_API_KEYS,
+    rpm_per_key=GEMINI_RPM_PER_KEY,
+    min_cooldown=GEMINI_MIN_COOLDOWN,
+)
 
-# Per-key состояние: {"cooldown_until": <monotonic sec>, "fails": <int>, "last_used": <ts>}
-# cooldown_until > loop.time() ⇒ ключ временно исключён из выбора (после 429/403).
-_key_states: List[Dict[str, Any]] = [
-    {"cooldown_until": 0.0, "fails": 0, "last_used": 0.0} for _ in GEMINI_API_KEYS
-]
+
+class NoHealthyKeys(Exception):
+    """Нет доступных рабочих ключей / невосстановимая ошибка запроса Gemini."""
 
 # Only Flash-Lite is currently available on the free tier — expose it as "Gemini".
 AVAILABLE_MODELS = [
@@ -104,13 +110,18 @@ LAST_REQUEST: Dict[int, float] = {}
 
 # ---------------- Anti-abuse (защита от спама и dodos) ----------------
 # Максимальная длина одного пользовательского сообщения (символов).
-# Обрезает атаки «пришлю мегабайт текста, чтобы съесть TPM».
-MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
-# Пер-юзер лимиты (по tg_id). Дневной сбрасывается в 00:00 UTC.
-PER_USER_HOURLY_LIMIT = int(os.environ.get("PER_USER_HOURLY_LIMIT", "20"))
-PER_USER_DAILY_LIMIT = int(os.environ.get("PER_USER_DAILY_LIMIT", "80"))
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "500"))
+# Пер-юзер лимиты (скользящее окно 60 мин / 24 ч по tg_id, хранятся в Mongo).
+FREE_HOURLY_LIMIT = int(os.environ.get("FREE_HOURLY_LIMIT", "20"))
+FREE_DAILY_LIMIT = int(os.environ.get("FREE_DAILY_LIMIT", "80"))
+LUXURY_HOURLY_LIMIT = int(os.environ.get("LUXURY_HOURLY_LIMIT", "60"))
+LUXURY_DAILY_LIMIT = int(os.environ.get("LUXURY_DAILY_LIMIT", "500"))
+WINDOW_HOUR_SEC = 3600
+WINDOW_DAY_SEC = 86400
 # Не более одного активного стрима на юзера одновременно (защита от «10 вкладок»).
 _active_generations: set[int] = set()
+# Флаг мягкого завершения: при shutdown/деплое новые генерации прерываются аккуратно.
+_shutting_down: bool = False
 
 # ---------------- Admins & Premium ----------------
 # Админы задаются в .env одним или двумя списками (через запятую).
@@ -134,18 +145,13 @@ def _is_admin(user_doc: Optional[Dict[str, Any]]) -> bool:
     return bool(uname and uname in ADMIN_TG_USERNAMES)
 
 
-def _is_premium(user_doc: Optional[Dict[str, Any]]) -> bool:
-    """Премиум если is_premium=True И (premium_until не задан ИЛИ ещё не истёк).
-    Админы автоматически считаются премиум."""
-    if not user_doc:
-        return False
-    if _is_admin(user_doc):
-        return True
-    if not user_doc.get("is_premium"):
+def _premium_active(user_doc: Optional[Dict[str, Any]]) -> bool:
+    """Действующая платная подписка (Luxury), НЕ учитывая админов."""
+    if not user_doc or not user_doc.get("is_premium"):
         return False
     until = user_doc.get("premium_until")
     if until is None:
-        return True  # бессрочный премиум
+        return True  # бессрочный
     if isinstance(until, str):
         try:
             until = datetime.fromisoformat(until)
@@ -154,6 +160,32 @@ def _is_premium(user_doc: Optional[Dict[str, Any]]) -> bool:
     if until.tzinfo is None:
         until = until.replace(tzinfo=timezone.utc)
     return until > now_utc()
+
+
+def _is_premium(user_doc: Optional[Dict[str, Any]]) -> bool:
+    """Luxury-подписка ИЛИ админ (создатель). Оставлено для отображения бейджа."""
+    if not user_doc:
+        return False
+    return _is_admin(user_doc) or _premium_active(user_doc)
+
+
+def _user_tier(user_doc: Optional[Dict[str, Any]]) -> str:
+    """creator (админ, без лимитов) | luxury (60/ч) | free (20/ч)."""
+    if _is_admin(user_doc):
+        return "creator"
+    if _premium_active(user_doc):
+        return "luxury"
+    return "free"
+
+
+def _tier_limits(user_doc: Optional[Dict[str, Any]]) -> Tuple[str, Optional[int], Optional[int]]:
+    """(tier, hourly_limit, daily_limit). None лимит = без ограничений (создатель)."""
+    tier = _user_tier(user_doc)
+    if tier == "creator":
+        return tier, None, None
+    if tier == "luxury":
+        return tier, LUXURY_HOURLY_LIMIT, LUXURY_DAILY_LIMIT
+    return tier, FREE_HOURLY_LIMIT, FREE_DAILY_LIMIT
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -313,6 +345,7 @@ def user_out(u: Dict[str, Any]) -> Dict[str, Any]:
             "photo_url": u.get("photo_url"),
             "is_admin": _is_admin(u),
             "is_premium": _is_premium(u),
+            "tier": _user_tier(u),
             "premium_until": premium_until}
 
 
@@ -403,6 +436,11 @@ async def public_config():
                 "heavy_chat_mb": CHAT_HEAVY_THRESHOLD_BYTES // (1024 * 1024),
                 "image_ttl_hours": IMAGE_TTL_SECONDS // 3600,
                 "chat_inactive_ttl_days": CONV_INACTIVE_TTL_SECONDS // 86400,
+                "max_input_chars": MAX_INPUT_CHARS,
+                "free_hourly": FREE_HOURLY_LIMIT,
+                "free_daily": FREE_DAILY_LIMIT,
+                "luxury_hourly": LUXURY_HOURLY_LIMIT,
+                "luxury_daily": LUXURY_DAILY_LIMIT,
             }}
 
 
@@ -538,86 +576,6 @@ def _friendly_error(status_code: int, body: str) -> str:
     return f"Ошибка Gemini API ({status_code})."
 
 
-_RETRY_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
-
-
-def _parse_retry_after(body: str, headers: Dict[str, str] | None = None) -> float:
-    """Извлекает рекомендованную задержку из тела ошибки Gemini или заголовков."""
-    if headers:
-        ra = headers.get("retry-after") or headers.get("Retry-After")
-        if ra:
-            try:
-                return float(ra)
-            except ValueError:
-                pass
-    m = _RETRY_RE.search(body or "")
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
-    return 0.0
-
-
-async def _gemini_throttle() -> None:
-    """Глобальный минимальный интервал между стартами вызовов Gemini на инстанс."""
-    global _gemini_last_call_ts
-    async with _gemini_gate:
-        now = asyncio.get_event_loop().time()
-        wait = GEMINI_MIN_INTERVAL_SEC - (now - _gemini_last_call_ts)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _gemini_last_call_ts = asyncio.get_event_loop().time()
-
-
-def _pick_key() -> Tuple[str, int, float]:
-    """
-    Возвращает (key, idx, wait_sec).
-    Выбирает СЛУЧАЙНЫЙ ключ среди «здоровых» (у которых cooldown_until <= now).
-    Если все на кулдауне — берёт ключ с ближайшим окончанием кулдауна и говорит,
-    сколько нужно подождать (wait_sec > 0).
-    """
-    if not GEMINI_API_KEYS:
-        return "", -1, 0.0
-    now = asyncio.get_event_loop().time()
-    available = [i for i, s in enumerate(_key_states) if s["cooldown_until"] <= now]
-    if available:
-        idx = random.choice(available)
-        wait = 0.0
-    else:
-        idx = min(range(len(_key_states)),
-                  key=lambda i: _key_states[i]["cooldown_until"])
-        wait = max(0.0, _key_states[idx]["cooldown_until"] - now)
-    _key_states[idx]["last_used"] = now
-    return GEMINI_API_KEYS[idx], idx, wait
-
-
-def _mark_key_cooldown(idx: int, retry_after: float, reason: str = "429") -> None:
-    if not (0 <= idx < len(_key_states)):
-        return
-    now = asyncio.get_event_loop().time()
-    # Минимум 30 сек. Если Google не прислал retry_after — ставим 10 мин (обычно это RPD, ждать долго).
-    if retry_after > 0:
-        wait = max(retry_after, 30.0)
-    else:
-        wait = 600.0
-    _key_states[idx]["cooldown_until"] = now + wait
-    _key_states[idx]["fails"] += 1
-    logger.info("Gemini key #%s put on cooldown for %.1fs (reason=%s, fails=%s)",
-                idx, wait, reason, _key_states[idx]["fails"])
-
-
-def _mark_key_ok(idx: int) -> None:
-    if 0 <= idx < len(_key_states):
-        _key_states[idx]["cooldown_until"] = 0.0
-        _key_states[idx]["fails"] = 0
-
-
-def _healthy_key_count() -> int:
-    now = asyncio.get_event_loop().time()
-    return sum(1 for s in _key_states if s["cooldown_until"] <= now)
-
-
 def _msg_parts_for_gemini(m: Dict[str, Any],
                           image_blobs: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build 'parts' array for a stored message when talking to Gemini."""
@@ -637,14 +595,14 @@ def _msg_parts_for_gemini(m: Dict[str, Any],
 
 async def gemini_stream(model: str, history: List[Dict[str, Any]]):
     """
-    Стримит ответ Gemini с:
-      • глобальным throttle (>=GEMINI_MIN_INTERVAL_SEC между стартами),
-      • round-robin ротацией нескольких API-ключей,
-      • авто-retry при 429: если Google просит подождать <= GEMINI_MAX_WAIT_ON_429 сек — ждём и повторяем;
-        иначе — переключаемся на следующий ключ. До GEMINI_MAX_ATTEMPTS попыток на запрос.
+    Стримит ответ Gemini через KeyManager:
+      • Round-Robin выбор ключа с индивидуальным per-key RPM (без глобального троттлинга);
+      • Failover: при отказе ключа автоматически берётся следующий рабочий;
+      • Корректная классификация ошибок (429/RESOURCE_EXHAUSTED/401/403/5xx);
+      • Если все ключи заняты ненадолго — короткое ожидание; иначе — NoHealthyKeys (→503/error).
     """
     if not GEMINI_API_KEYS:
-        raise RuntimeError("GEMINI_API_KEY не настроен на сервере.")
+        raise NoHealthyKeys("GEMINI_API_KEY не настроен на сервере.")
 
     url = f"{GEMINI_BASE}/{model}:streamGenerateContent?alt=sse"
     body = {
@@ -654,36 +612,36 @@ async def gemini_stream(model: str, history: List[Dict[str, Any]]):
     }
 
     last_err: Optional[str] = None
-    tried_in_this_request: set[int] = set()
+    used_key_count = 0
 
     for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
-        await _gemini_throttle()
-        key, key_idx, wait_needed = _pick_key()
+        key, key_idx, wait = key_manager.acquire()
 
-        # Все ключи в кулдауне: возможно недолго подождать и попробовать снова.
-        if wait_needed > 0:
-            if wait_needed <= GEMINI_MAX_WAIT_ON_429 and attempt < GEMINI_MAX_ATTEMPTS:
-                logger.info("All keys on cooldown, sleeping %.1fs", wait_needed + 0.3)
-                await asyncio.sleep(wait_needed + 0.3)
-                tried_in_this_request.clear()
-                # после сна ключ уже «здоров», возьмём его следующим кругом
+        if key is None:
+            # Нет доступных ключей прямо сейчас.
+            if wait is not None and wait <= GEMINI_MAX_WAIT and attempt < GEMINI_MAX_ATTEMPTS:
+                logger.info("No key available, waiting %.1fs (attempt %s)", wait, attempt)
+                await asyncio.sleep(wait + 0.2)
                 continue
-            last_err = (f"Сервис временно перегружен. "
-                        f"Повторите через ~{int(wait_needed)} сек.")
-            raise RuntimeError(last_err)
+            key_manager.record_503()
+            if wait is not None:
+                raise NoHealthyKeys(
+                    f"Сервис временно перегружен. Повторите через ~{int(wait) + 1} сек.")
+            raise NoHealthyKeys(last_err or "Нет доступных API-ключей. Попробуйте позже.")
 
-        # В рамках одного запроса не долбим один и тот же ключ повторно, если ключей >= 2.
-        if key_idx in tried_in_this_request and _healthy_key_count() > 0:
-            # даём _pick_key ещё шанс на другом ключе
-            continue
-        tried_in_this_request.add(key_idx)
+        # Считаем переключение между ключами (failover) в рамках одного запроса.
+        used_key_count += 1
+        if used_key_count > 1:
+            key_manager.record_switch()
 
         headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        t0 = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as hc:
                 async with hc.stream("POST", url, headers=headers, json=body) as resp:
                     if resp.status_code == 200:
-                        _mark_key_ok(key_idx)
+                        key_manager.report_success(key_idx)
+                        first_token = True
                         async for line in resp.aiter_lines():
                             if not line or not line.startswith("data:"):
                                 continue
@@ -697,112 +655,165 @@ async def gemini_stream(model: str, history: List[Dict[str, Any]]):
                             for cand in obj.get("candidates", []):
                                 for part in cand.get("content", {}).get("parts", []):
                                     if part.get("text"):
+                                        if first_token:
+                                            # Время до первого токена — репрезентативная латентность Gemini.
+                                            key_manager.record_success_request(time.monotonic() - t0)
+                                            first_token = False
                                         yield part["text"]
+                        if first_token:  # успех без текста — всё равно считаем запрос
+                            key_manager.record_success_request(time.monotonic() - t0)
                         return  # успех
 
-                    # не-200: читаем тело и решаем, что делать
+                    # не-200: читаем тело и решаем через KeyManager
                     detail = (await resp.aread()).decode("utf-8", "ignore")[:800]
-                    logger.error("Gemini error %s (key #%s, attempt %s/%s): %s",
-                                 resp.status_code, key_idx, attempt, GEMINI_MAX_ATTEMPTS, detail)
+                    kind = classify_error(resp.status_code, detail)
                     last_err = _friendly_error(resp.status_code, detail)
+                    logger.error("Gemini error %s (key #%s, kind=%s, attempt %s/%s): %s",
+                                 resp.status_code, key_idx, kind, attempt, GEMINI_MAX_ATTEMPTS, detail[:200])
 
-                    if resp.status_code == 429:
-                        retry_sec = _parse_retry_after(detail, dict(resp.headers))
-                        _mark_key_cooldown(key_idx, retry_sec, reason="429")
-                        # есть другие живые ключи → сразу свитч
-                        if _healthy_key_count() > 0:
-                            continue
-                        # все на кулдауне: короткий retry-loop, если ждать недолго
-                        if 0 < retry_sec <= GEMINI_MAX_WAIT_ON_429:
-                            logger.info("All keys exhausted, waiting %.1fs", retry_sec + 0.3)
-                            await asyncio.sleep(retry_sec + 0.3)
-                            tried_in_this_request.clear()
-                            continue
-                        if retry_sec > 0:
-                            last_err = (f"Сервис временно перегружен. "
-                                        f"Повторите через ~{int(retry_sec)} сек.")
-                        raise RuntimeError(last_err)
-
-                    if resp.status_code in (401, 403):
-                        # ключ реально плохой (отозван/не имеет доступа) — надолго в бан
-                        _mark_key_cooldown(key_idx, 3600.0, reason=f"http-{resp.status_code}")
-                        if _healthy_key_count() > 0:
-                            continue
-                        raise RuntimeError(last_err)
-
-                    if resp.status_code >= 500:
-                        await asyncio.sleep(min(2.0 * attempt, 6.0))
+                    if kind == "daily_limit":
+                        key_manager.report_daily_limit(key_idx)
+                        continue  # failover на следующий ключ
+                    if kind == "cooldown":
+                        key_manager.report_rate_limit(
+                            key_idx, parse_retry_after(detail, dict(resp.headers)))
                         continue
-
-                    # 4xx кроме перечисленных — не ретраим
-                    raise RuntimeError(last_err)
+                    if kind == "invalid":
+                        key_manager.report_invalid(key_idx)
+                        continue
+                    if kind == "forbidden":
+                        key_manager.report_forbidden(key_idx)
+                        continue
+                    if kind == "broken":
+                        key_manager.report_server_error(key_idx, attempt)
+                        continue
+                    # прочие 4xx (safety / валидация) — не проблема ключа, не ретраим
+                    raise NoHealthyKeys(last_err)
         except httpx.HTTPError as e:
-            logger.warning("Gemini network error (attempt %s): %s", attempt, e)
+            logger.warning("Gemini network error (key #%s, attempt %s): %s", key_idx, attempt, e)
+            key_manager.report_network_error(key_idx)
             last_err = "Сеть недоступна. Попробуйте ещё раз."
-            await asyncio.sleep(min(1.5 * attempt, 5.0))
             continue
 
-    raise RuntimeError(last_err or "Не удалось получить ответ Gemini.")
+    key_manager.record_503()
+    raise NoHealthyKeys(last_err or "Не удалось получить ответ Gemini.")
+
+
+async def _probe_keys_on_startup() -> None:
+    """Проверяет каждый ключ сразу после старта (в фоне), чтобы битые ключи
+    были видны в логах немедленно, а не спустя часы."""
+    if not GEMINI_API_KEYS:
+        logger.warning("No Gemini keys configured — nothing to probe.")
+        return
+    logger.info("Probing %s Gemini key(s) on startup...", len(GEMINI_API_KEYS))
+
+    async def _probe(i: int, k: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as hc:
+                r = await hc.get(GEMINI_BASE, headers={"x-goog-api-key": k},
+                                 params={"pageSize": 1})
+            if r.status_code == 200:
+                key_manager.report_success(i)
+                return
+            kind = classify_error(r.status_code, r.text)
+            if kind == "invalid":
+                key_manager.report_invalid(i, "invalid at startup probe (401)")
+            elif kind == "forbidden":
+                key_manager.report_forbidden(i, "forbidden at startup probe (403)")
+            elif kind == "daily_limit":
+                key_manager.report_daily_limit(i, "daily quota at startup")
+            elif kind == "cooldown":
+                key_manager.report_rate_limit(i, parse_retry_after(r.text, dict(r.headers)),
+                                              "rate-limited at startup")
+            elif kind == "broken":
+                key_manager.report_server_error(i, reason="5xx at startup probe")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Key #%s startup probe network error: %s", i, e)
+
+    await asyncio.gather(*(_probe(i, k) for i, k in enumerate(GEMINI_API_KEYS)))
+    h = key_manager.health()
+    logger.info("Loaded keys: %s | Healthy: %s | Cooldown: %s | Daily Limit: %s | "
+                "Invalid: %s | Forbidden: %s | Broken: %s",
+                h["total_keys"], h["healthy"], h["cooldown"], h["daily_limit"],
+                h["invalid"], h["forbidden"], h["broken"])
 
 
 # ------------------------------------------------------------------ per-user quotas / anti-abuse
-def _period_keys() -> Tuple[str, str]:
-    """Возвращает (hour_key, day_key) в UTC для группировки счётчиков."""
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y%m%d%H"), now.strftime("%Y%m%d")
+def _aware(dt: datetime) -> datetime:
+    """Гарантирует tz-aware UTC datetime (Mongo возвращает naive)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
-async def _check_and_bump_user_quota(tg_id: int) -> None:
+async def _usage_snapshot(tg_id: int, user_doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Атомарно инкрементит per-hour и per-day счётчики для tg_id.
-    Если после инкремента лимит превышен — откатывает и бросает 429.
-    Данные лежат в коллекции user_usage с TTL 48 часов (авто-очистка Mongo).
-    Premium-юзеры и админы обходят лимиты (никаких проверок).
+    Считает использование по СКОЛЬЗЯЩИМ окнам (60 мин / 24 ч) на основе абсолютных
+    timestamps в Mongo. Возвращает состояние для UI и проверок лимитов.
+    Всё считается по времени → устойчиво к перезапуску/усыплению backend.
     """
-    # Premium/admin bypass — лимиты не применяются вообще.
-    user_doc = await db.users.find_one({"tg_id": tg_id})
-    if _is_premium(user_doc):
-        return
+    tier, hourly, daily = _tier_limits(user_doc)
+    if hourly is None:  # создатель — без ограничений
+        return {"tier": tier, "unlimited": True,
+                "hourly_limit": None, "hourly_used": 0, "hourly_remaining": None,
+                "daily_limit": None, "daily_used": 0, "daily_remaining": None,
+                "blocked": False, "retry_at": None, "reason": None}
 
-    hour_key, day_key = _period_keys()
-    now = datetime.now(timezone.utc)
+    now = now_utc()
+    hour_ago = now - timedelta(seconds=WINDOW_HOUR_SEC)
+    day_ago = now - timedelta(seconds=WINDOW_DAY_SEC)
+    coll = db.user_requests
+    hour_count = await coll.count_documents({"tg_id": tg_id, "ts": {"$gte": hour_ago}})
+    day_count = await coll.count_documents({"tg_id": tg_id, "ts": {"$gte": day_ago}})
 
-    # Инкрементим оба счётчика (upsert)
-    await db.user_usage.update_one(
-        {"tg_id": tg_id, "period": day_key, "kind": "day"},
-        {"$inc": {"count": 1}, "$set": {"updated_at": now}},
-        upsert=True,
-    )
-    await db.user_usage.update_one(
-        {"tg_id": tg_id, "period": hour_key, "kind": "hour"},
-        {"$inc": {"count": 1}, "$set": {"updated_at": now}},
-        upsert=True,
-    )
-    # Читаем актуальные значения
-    day_doc = await db.user_usage.find_one({"tg_id": tg_id, "period": day_key, "kind": "day"})
-    hour_doc = await db.user_usage.find_one({"tg_id": tg_id, "period": hour_key, "kind": "hour"})
-    day_cnt = int((day_doc or {}).get("count", 0))
-    hour_cnt = int((hour_doc or {}).get("count", 0))
+    blocked = False
+    retry_at: Optional[datetime] = None
+    reason: Optional[str] = None
 
-    if hour_cnt > PER_USER_HOURLY_LIMIT:
-        # откатим инкремент, чтобы юзер не «сжигал» лимит впустую при повторах
-        await db.user_usage.update_one(
-            {"tg_id": tg_id, "period": hour_key, "kind": "hour"},
-            {"$inc": {"count": -1}},
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=f"Слишком часто. Лимит {PER_USER_HOURLY_LIMIT} сообщений в час исчерпан. Попробуйте позже.",
-        )
-    if day_cnt > PER_USER_DAILY_LIMIT:
-        await db.user_usage.update_one(
-            {"tg_id": tg_id, "period": day_key, "kind": "day"},
-            {"$inc": {"count": -1}},
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=f"Дневной лимит ({PER_USER_DAILY_LIMIT} сообщений) исчерпан. Возвращайтесь завтра.",
-        )
+    if hour_count >= hourly:
+        oldest = await coll.find_one({"tg_id": tg_id, "ts": {"$gte": hour_ago}}, sort=[("ts", 1)])
+        if oldest:
+            retry_at = _aware(oldest["ts"]) + timedelta(seconds=WINDOW_HOUR_SEC)
+            blocked, reason = True, "hour"
+    if day_count >= daily:
+        oldest = await coll.find_one({"tg_id": tg_id, "ts": {"$gte": day_ago}}, sort=[("ts", 1)])
+        day_retry = (_aware(oldest["ts"]) + timedelta(seconds=WINDOW_DAY_SEC)) if oldest else now
+        if not retry_at or day_retry > retry_at:
+            retry_at = day_retry
+        blocked = True
+        reason = reason or "day"
+
+    return {
+        "tier": tier, "unlimited": False,
+        "hourly_limit": hourly, "hourly_used": hour_count,
+        "hourly_remaining": max(0, hourly - hour_count),
+        "daily_limit": daily, "daily_used": day_count,
+        "daily_remaining": max(0, daily - day_count),
+        "blocked": blocked,
+        "retry_at": retry_at.isoformat() if retry_at else None,
+        "reason": reason,
+    }
+
+
+async def _check_and_record_usage(tg_id: int, user_doc: Optional[Dict[str, Any]]) -> None:
+    """
+    Проверяет скользящие лимиты и, если ок, записывает timestamp запроса.
+    Создатель (админ) — без ограничений. Free: 20/60мин, Luxury: 60/60мин (+ дневные).
+    При превышении бросает 429 с retry_at (абсолютное время следующего слота).
+    """
+    tier, hourly, daily = _tier_limits(user_doc)
+    if hourly is None:
+        return  # создатель — безлимит
+
+    snap = await _usage_snapshot(tg_id, user_doc)
+    if snap["blocked"]:
+        if snap["reason"] == "day":
+            msg = f"Дневной лимит ({daily} сообщений) исчерпан. Попробуйте позже."
+        else:
+            msg = f"Лимит {hourly} сообщений за 60 минут исчерпан. Подождите таймер."
+        raise HTTPException(status_code=429, detail=msg)
+
+    await db.user_requests.insert_one({"tg_id": tg_id, "ts": now_utc()})
 
 
 async def _maybe_summarise(cid: str) -> None:
@@ -833,10 +844,9 @@ async def _maybe_summarise(cid: str) -> None:
     }
     summary_text = previous_summary
     try:
-        await _gemini_throttle()
-        key, key_idx, wait_needed = _pick_key()
-        if not key or wait_needed > 0:
-            # все ключи на кулдауне — просто пропускаем фоновую суммаризацию
+        key, key_idx, wait = key_manager.acquire()
+        if not key:
+            # все ключи заняты — просто пропускаем фоновую суммаризацию
             raise RuntimeError("no healthy gemini key for summary")
         async with httpx.AsyncClient(timeout=60.0) as hc:
             r = await hc.post(f"{GEMINI_BASE}/{DEFAULT_MODEL}:generateContent",
@@ -844,14 +854,23 @@ async def _maybe_summarise(cid: str) -> None:
                                        "Content-Type": "application/json"},
                               json=request)
             if r.status_code == 200:
-                _mark_key_ok(key_idx)
+                key_manager.report_success(key_idx)
                 data = r.json()
                 parts = ((data.get("candidates") or [{}])[0]
                          .get("content", {}).get("parts", []))
                 summary_text = "".join(p.get("text", "") for p in parts).strip() or previous_summary
             else:
-                if r.status_code == 429:
-                    _mark_key_cooldown(key_idx, _parse_retry_after(r.text, dict(r.headers)), "429-summary")
+                kind = classify_error(r.status_code, r.text)
+                if kind == "daily_limit":
+                    key_manager.report_daily_limit(key_idx)
+                elif kind == "cooldown":
+                    key_manager.report_rate_limit(key_idx, parse_retry_after(r.text, dict(r.headers)))
+                elif kind == "invalid":
+                    key_manager.report_invalid(key_idx)
+                elif kind == "forbidden":
+                    key_manager.report_forbidden(key_idx)
+                elif kind == "broken":
+                    key_manager.report_server_error(key_idx)
                 logger.warning("summary call failed: %s %s", r.status_code, r.text[:200])
     except Exception as e:  # noqa: BLE001
         logger.warning("summary error: %s", e)
@@ -909,19 +928,18 @@ async def chat_stream(body: ChatRequest, request: Request, tg_id: int = Depends(
     wait = COOLDOWN_SECONDS - (now_utc().timestamp() - last)
     if wait > 0:
         raise HTTPException(status_code=429, detail=f"Слишком часто. Подождите {int(wait) + 1} сек.")
-    LAST_REQUEST[tg_id] = now_utc().timestamp()
 
-    # Anti-abuse: часовой + дневной лимит по tg_id (в Mongo, персистентно).
-    await _check_and_bump_user_quota(tg_id)
-
-    # Fail-fast: если все ключи Gemini в кулдауне — не мучаем юзера ожиданием.
-    if _healthy_key_count() == 0:
-        # откатим только что засчитанный запрос — он ведь не выполнится
-        hk, dk = _period_keys()
-        await db.user_usage.update_one({"tg_id": tg_id, "period": hk, "kind": "hour"}, {"$inc": {"count": -1}})
-        await db.user_usage.update_one({"tg_id": tg_id, "period": dk, "kind": "day"}, {"$inc": {"count": -1}})
+    # Предполётная проверка ключей: если рабочих нет и ждать долго — не жжём лимит юзера.
+    available_now, key_wait, recoverable = key_manager.peek()
+    if not available_now and (not recoverable or key_wait is None or key_wait > GEMINI_MAX_WAIT):
+        key_manager.record_503()
         raise HTTPException(status_code=503, detail="Сервис временно перегружен. Попробуйте через минуту.")
 
+    # Per-user скользящие лимиты (Free 20/60мин, Luxury 60/60мин, создатель — без лимита).
+    user_doc = await db.users.find_one({"tg_id": tg_id})
+    await _check_and_record_usage(tg_id, user_doc)
+
+    LAST_REQUEST[tg_id] = now_utc().timestamp()
     _active_generations.add(tg_id)
 
     # validate referenced images (must belong to caller and still be alive)
@@ -996,9 +1014,13 @@ async def chat_stream(body: ChatRequest, request: Request, tg_id: int = Depends(
             collected: List[str] = []
             try:
                 async for delta in gemini_stream(body.model, history):
+                    if _shutting_down:
+                        # Мягкое завершение при деплое/рестарте: аккуратно останавливаем поток.
+                        yield f"data: {json.dumps({'type': 'error', 'message': 'Сервер перезапускается, повторите запрос через несколько секунд.'})}\n\n"
+                        break
                     collected.append(delta)
                     yield f"data: {json.dumps({'type': 'delta', 'text': delta})}\n\n"
-            except RuntimeError as e:
+            except (NoHealthyKeys, RuntimeError) as e:
                 yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             except Exception:  # noqa: BLE001
                 logger.exception("stream failed")
@@ -1031,25 +1053,30 @@ async def root():
     return {"message": "AI Workspace API", "status": "ok"}
 
 
+def _health_payload() -> Dict[str, Any]:
+    h = key_manager.health()
+    return {"status": "degraded" if _shutting_down else "ok",
+            "shutting_down": _shutting_down,
+            "keys": h}
+
+
+@api.get("/health")
+async def api_health():
+    """Мониторинг: статус backend + количество ключей по статусам."""
+    return _health_payload()
+
+
 @api.get("/gemini/keys/status")
-async def gemini_keys_status(tg_id: int = Depends(get_current_tg_id)):
-    """Диагностика: сколько ключей загружено, кто на кулдауне и сколько осталось ждать.
-    Сами ключи не отдаём — только последние 4 символа."""
-    now = asyncio.get_event_loop().time()
-    items = []
-    for i, s in enumerate(_key_states):
-        remaining = max(0.0, s["cooldown_until"] - now)
-        k = GEMINI_API_KEYS[i] if i < len(GEMINI_API_KEYS) else ""
-        items.append({
-            "idx": i,
-            "tail": k[-4:] if k else "",
-            "healthy": remaining <= 0,
-            "cooldown_remaining_sec": round(remaining, 1),
-            "fails_total": s["fails"],
-        })
-    return {"total_keys": len(GEMINI_API_KEYS),
-            "healthy_now": sum(1 for it in items if it["healthy"]),
-            "keys": items}
+async def gemini_keys_status(_admin: Dict[str, Any] = Depends(require_admin)):
+    """Подробное состояние всех ключей (без раскрытия самих ключей). Только для админа."""
+    return key_manager.summary()
+
+
+@api.get("/usage/status")
+async def usage_status(tg_id: int = Depends(get_current_tg_id)):
+    """Текущее использование лимитов пользователя (скользящее окно) + время разблокировки."""
+    user = await db.users.find_one({"tg_id": tg_id})
+    return await _usage_snapshot(tg_id, user)
 
 
 # ------------------------------------------------------------------ Admin panel
@@ -1086,6 +1113,7 @@ def _admin_user_out(u: Dict[str, Any]) -> Dict[str, Any]:
         "photo_url": u.get("photo_url"),
         "is_admin": _is_admin(u),
         "is_premium": _is_premium(u),
+        "tier": _user_tier(u),
         "premium_until": u["premium_until"].isoformat() if isinstance(u.get("premium_until"), datetime) else u.get("premium_until"),
         "created_at": u["created_at"].isoformat() if isinstance(u.get("created_at"), datetime) else u.get("created_at"),
         "last_login_at": u["last_login_at"].isoformat() if isinstance(u.get("last_login_at"), datetime) else u.get("last_login_at"),
@@ -1162,17 +1190,25 @@ async def admin_stats(_admin: Dict[str, Any] = Depends(require_admin)):
     now = now_utc()
     active_24h = await db.users.count_documents({"last_login_at": {"$gte": now - timedelta(hours=24)}})
     active_7d = await db.users.count_documents({"last_login_at": {"$gte": now - timedelta(days=7)}})
+    keys = key_manager.summary()
     return {
         "total_users": total,
         "premium_users": premium,
         "active_24h": active_24h,
         "active_7d": active_7d,
-        "gemini_keys_total": len(GEMINI_API_KEYS),
-        "gemini_keys_healthy": _healthy_key_count(),
+        "gemini_keys_total": keys["total"],
+        "gemini_keys_healthy": keys["healthy"],
+        "gemini_keys": keys,
     }
 
 
 app.include_router(api)
+
+
+@app.get("/health")
+async def health():
+    """Root-level health-check для мониторинга (Render и т.п.)."""
+    return _health_payload()
 
 
 # ------------------------------------------------------------------ security middleware
@@ -1210,9 +1246,9 @@ async def _startup():
     await db.chat_images.create_index("expire_at", expireAfterSeconds=0)
     await db.chat_images.create_index("tg_id")
 
-    # Per-user usage counters (anti-abuse): TTL 48h — старые счётчики автоудаляются.
-    await db.user_usage.create_index([("tg_id", 1), ("period", 1), ("kind", 1)], unique=True)
-    await db.user_usage.create_index("updated_at", expireAfterSeconds=48 * 60 * 60)
+    # Per-user request timestamps (скользящее окно лимитов): индекс + TTL 25ч.
+    await db.user_requests.create_index([("tg_id", 1), ("ts", 1)])
+    await db.user_requests.create_index("ts", expireAfterSeconds=25 * 60 * 60)
 
     # One-time cleanup: legacy split-messages collection is no longer used.
     try:
@@ -1240,7 +1276,20 @@ async def _startup():
 
     logger.info("AI Workspace API started (env=%s)", ENVIRONMENT)
 
+    # Фоновая проверка всех ключей сразу после старта (не блокирует запуск).
+    asyncio.create_task(_probe_keys_on_startup())
+
 
 @app.on_event("shutdown")
 async def _shutdown():
+    # Graceful shutdown: перестаём принимать новые генерации и даём активным завершиться.
+    global _shutting_down
+    _shutting_down = True
+    logger.info("Shutdown initiated — waiting for %s active generation(s) to drain...",
+                len(_active_generations))
+    for _ in range(50):  # максимум ~25 сек ожидания
+        if not _active_generations:
+            break
+        await asyncio.sleep(0.5)
     client.close()
+    logger.info("Shutdown complete.")
