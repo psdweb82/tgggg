@@ -120,12 +120,16 @@ export default function Sidebar({ conversations, activeId, onSelect, onNew, onDe
           <div className="flex-1 min-w-0">
             <p className="text-sm text-white truncate">
               {user?.first_name} {user?.last_name || ""}
-              {user?.is_premium && !user?.is_admin && (
-                <span className="ml-1.5 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-[1px] text-[9px] uppercase tracking-wider font-mono align-middle">premium</span>
-              )}
             </p>
-            <p className="text-[11px] text-white/40 truncate">
-              {user?.username ? `@${user.username}` : `ID ${user?.tg_id}`}
+            <p data-testid="subscription-label" className="text-[11px] truncate flex items-center gap-1.5">
+              <span className="text-white/40">Subscription:</span>
+              {user?.tier === "creator" ? (
+                <span className="rounded bg-violet-500/10 text-violet-300 border border-violet-500/20 px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono">Creator</span>
+              ) : user?.tier === "luxury" ? (
+                <span className="rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono">Luxury</span>
+              ) : (
+                <span className="rounded bg-white/[0.06] text-white/60 border border-white/10 px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono">Free</span>
+              )}
             </p>
           </div>
           <button data-testid="logout-button" onClick={logout} aria-label="Выйти" className="h-8 w-8 rounded-lg text-white/50 hover:text-white hover:bg-white/[0.06] flex items-center justify-center transition-colors">
