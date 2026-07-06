@@ -32,6 +32,7 @@ export const api = {
   telegramWebApp: (initData) => req("/auth/telegram-webapp", { method: "POST", body: { init_data: initData }, auth: false }),
   devLogin: (payload) => req("/auth/dev-login", { method: "POST", body: payload, auth: false }),
   me: () => req("/auth/me"),
+  usageStatus: () => req("/usage/status"),
   models: () => req("/models", { auth: false }),
   listConversations: () => req("/conversations"),
   getConversation: (id) => req(`/conversations/${id}`),
