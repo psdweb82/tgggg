@@ -51,18 +51,20 @@ function KeysPanel({ keys, onRefresh }) {
     return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) +
       " " + d.toLocaleDateString("ru-RU", { day: "2-digit", month: "short" });
   };
+  const totalSuccess = (keys.keys || []).reduce((s, k) => s + (k.success || 0), 0);
+  const share = (k) => (totalSuccess > 0 ? (k.success / totalSuccess) * 100 : 0);
   return (
-    <div data-testid="keys-panel" className="px-5 pt-4">
+    <div data-testid="keys-panel" className="px-4 sm:px-5 pt-4">
       <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
-        <div className="flex items-center justify-between mb-2.5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2.5">
           <p className="text-[11px] uppercase tracking-wider text-white/50 font-mono">Состояние API-ключей ({keys.total})</p>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
             <button
               data-testid="refresh-key-stats"
               onClick={() => onRefresh?.()}
               className="inline-flex items-center gap-1.5 text-[11px] text-white/60 hover:text-white transition-colors rounded-md border border-white/10 hover:border-white/25 px-2 py-1"
             >
-              <RefreshCw className="h-3 w-3" strokeWidth={2} /> Refresh key stats
+              <RefreshCw className="h-3 w-3" strokeWidth={2} /> Обновить
             </button>
             <button
               data-testid="toggle-keys-detail"
@@ -82,7 +84,7 @@ function KeysPanel({ keys, onRefresh }) {
           <KeyChip label="Broken" count={keys.broken} cls={KEY_STATUS_STYLE.broken} />
         </div>
 
-        <div data-testid="keys-metrics" className="mt-3 grid grid-cols-2 sm:grid-cols-6 gap-2">
+        <div data-testid="keys-metrics" className="mt-3 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
           <Metric label="Всего запросов" value={m.total_requests} />
           <Metric label="Ср. ответ" value={m.avg_response_ms != null ? `${m.avg_response_ms} мс` : "—"} />
           <Metric label="Переключений" value={m.total_switches} />
@@ -92,35 +94,47 @@ function KeysPanel({ keys, onRefresh }) {
         </div>
 
         {open && (
-          <div data-testid="keys-detail-list" className="mt-3 max-h-60 overflow-y-auto rounded-lg border border-white/[0.05]">
-            <table className="w-full text-[11px]">
-              <thead className="text-white/40 font-mono uppercase tracking-wider sticky top-0 bg-[#0a0a0b]">
+          <div data-testid="keys-detail-list" className="mt-3 max-h-72 overflow-auto rounded-lg border border-white/[0.05]">
+            <table className="w-full min-w-[640px] text-[11px]">
+              <thead className="text-white/40 font-mono uppercase tracking-wider sticky top-0 bg-[#0a0a0b] z-10">
                 <tr className="text-left">
                   <th className="px-2 py-1.5">#</th>
                   <th className="px-2 py-1.5">Статус</th>
                   <th className="px-2 py-1.5 text-right">OK</th>
                   <th className="px-2 py-1.5 text-right">Err</th>
-                  <th className="px-2 py-1.5 text-right">Запросов</th>
+                  <th className="px-2 py-1.5 text-right">Выдач</th>
+                  <th className="px-2 py-1.5 w-[130px]">Доля</th>
                   <th className="px-2 py-1.5">Активация</th>
                   <th className="px-2 py-1.5">Причина</th>
                 </tr>
               </thead>
               <tbody>
-                {keys.keys?.map((k) => (
-                  <tr key={k.idx} data-testid={`key-row-${k.idx}`} className="border-t border-white/[0.04] text-white/70">
-                    <td className="px-2 py-1.5 font-mono">{k.idx}</td>
-                    <td className="px-2 py-1.5">
-                      <span className={`rounded border px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono ${KEY_STATUS_STYLE[k.status] || "bg-white/5 text-white/60 border-white/10"}`}>
-                        {k.status_label}
-                      </span>
-                    </td>
-                    <td className="px-2 py-1.5 text-right tabular-nums text-emerald-300/80">{k.success}</td>
-                    <td className="px-2 py-1.5 text-right tabular-nums text-red-300/70">{k.errors}</td>
-                    <td className="px-2 py-1.5 text-right tabular-nums">{k.served}</td>
-                    <td className="px-2 py-1.5 font-mono text-white/50">{k.next_activation_at ? fmtNext(k.next_activation_at) : "—"}</td>
-                    <td className="px-2 py-1.5 text-white/45 truncate max-w-[140px]" title={k.last_reason}>{k.last_reason || "—"}</td>
-                  </tr>
-                ))}
+                {keys.keys?.map((k) => {
+                  const pct = share(k);
+                  return (
+                    <tr key={k.idx} data-testid={`key-row-${k.idx}`} className="border-t border-white/[0.04] text-white/70">
+                      <td className="px-2 py-1.5 font-mono">{k.idx}</td>
+                      <td className="px-2 py-1.5">
+                        <span className={`rounded border px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono whitespace-nowrap ${KEY_STATUS_STYLE[k.status] || "bg-white/5 text-white/60 border-white/10"}`}>
+                          {k.status_label}
+                        </span>
+                      </td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-emerald-300/80">{k.success}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-red-300/70">{k.errors}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums">{k.served}</td>
+                      <td className="px-2 py-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <div className="h-1.5 flex-1 rounded-full bg-white/[0.06] overflow-hidden">
+                            <div className="h-full rounded-full bg-white/40" style={{ width: `${Math.min(100, pct)}%` }} />
+                          </div>
+                          <span className="tabular-nums text-white/50 w-9 text-right">{pct.toFixed(1)}%</span>
+                        </div>
+                      </td>
+                      <td className="px-2 py-1.5 font-mono text-white/50 whitespace-nowrap">{k.next_activation_at ? fmtNext(k.next_activation_at) : "—"}</td>
+                      <td className="px-2 py-1.5 text-white/45 truncate max-w-[180px]" title={k.last_reason}>{k.last_reason || "—"}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -150,35 +164,37 @@ function UserRow({ u, onGrant, onRevoke, busyId }) {
   return (
     <div
       data-testid={`admin-user-row-${u.tg_id}`}
-      className="group flex items-center gap-3 rounded-xl border border-white/[0.05] bg-white/[0.015] hover:bg-white/[0.03] px-3 py-2.5 transition-colors"
+      className="group flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 rounded-xl border border-white/[0.05] bg-white/[0.015] hover:bg-white/[0.03] px-3 py-2.5 transition-colors"
     >
-      <div className="h-9 w-9 shrink-0 rounded-lg bg-gradient-to-br from-white/10 to-white/[0.03] ring-1 ring-white/[0.06] flex items-center justify-center overflow-hidden">
-        {u.photo_url ? (
-          <img src={u.photo_url} alt="" className="h-full w-full object-cover" />
-        ) : (
-          <span className="text-white/70 text-sm">{(u.first_name?.[0] || "?").toUpperCase()}</span>
-        )}
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1.5">
-          <p className="truncate text-sm text-white">{displayName}</p>
-          {u.is_admin && (
-            <span className="shrink-0 rounded-md bg-violet-500/10 text-violet-300 border border-violet-500/20 px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono">admin</span>
-          )}
-          {u.is_premium && !u.is_admin && (
-            <span className="shrink-0 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono">Luxury</span>
+      <div className="flex items-center gap-3 min-w-0 flex-1">
+        <div className="h-9 w-9 shrink-0 rounded-lg bg-gradient-to-br from-white/10 to-white/[0.03] ring-1 ring-white/[0.06] flex items-center justify-center overflow-hidden">
+          {u.photo_url ? (
+            <img src={u.photo_url} alt="" className="h-full w-full object-cover" />
+          ) : (
+            <span className="text-white/70 text-sm">{(u.first_name?.[0] || "?").toUpperCase()}</span>
           )}
         </div>
-        <p className="text-[11px] text-white/40 truncate font-mono">
-          {handle}
-          {u.is_premium && !u.is_admin ? ` · ${untilLabel}` : ""}
-        </p>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <p className="truncate text-sm text-white">{displayName}</p>
+            {u.is_admin && (
+              <span className="shrink-0 rounded-md bg-violet-500/10 text-violet-300 border border-violet-500/20 px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono">admin</span>
+            )}
+            {u.is_premium && !u.is_admin && (
+              <span className="shrink-0 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-[1px] text-[9.5px] uppercase tracking-wider font-mono">Luxury</span>
+            )}
+          </div>
+          <p className="text-[11px] text-white/40 truncate font-mono">
+            {handle}
+            {u.is_premium && !u.is_admin ? ` · ${untilLabel}` : ""}
+          </p>
+        </div>
       </div>
 
       {u.is_admin ? (
-        <span className="text-[11px] text-white/35 pr-2">не редактируется</span>
+        <span className="text-[11px] text-white/35 sm:pr-2 pl-12 sm:pl-0">не редактируется</span>
       ) : (
-        <div className="flex items-center gap-1.5 opacity-70 group-hover:opacity-100 transition-opacity">
+        <div className="flex items-center gap-1.5 flex-wrap pl-12 sm:pl-0 sm:opacity-70 sm:group-hover:opacity-100 transition-opacity">
           {!u.is_premium && DURATIONS.map((d) => (
             <button
               key={d.label}
@@ -280,14 +296,14 @@ export default function AdminPanel({ open, onClose }) {
   return (
     <div
       data-testid="admin-panel-backdrop"
-      className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-stretch sm:items-center justify-center p-0 sm:p-4"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div
         data-testid="admin-panel"
-        className="w-full max-w-3xl max-h-[88vh] rounded-2xl bg-[#0a0a0b] border border-white/[0.08] shadow-[0_20px_80px_rgba(0,0,0,0.6)] overflow-hidden flex flex-col"
+        className="w-full sm:max-w-3xl h-full sm:h-auto sm:max-h-[90vh] rounded-none sm:rounded-2xl bg-[#0a0a0b] border border-white/[0.08] shadow-[0_20px_80px_rgba(0,0,0,0.6)] overflow-hidden flex flex-col"
       >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
+        <div className="flex items-center justify-between px-4 sm:px-5 py-4 border-b border-white/[0.06]">
           <div className="flex items-center gap-2.5">
             <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-violet-500/20 to-violet-500/5 border border-violet-500/20 flex items-center justify-center">
               <ShieldCheck className="h-4 w-4 text-violet-300" strokeWidth={1.75} />
@@ -307,7 +323,7 @@ export default function AdminPanel({ open, onClose }) {
           </button>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5 px-5 pt-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5 px-4 sm:px-5 pt-4">
           <StatCard icon={UsersIcon} label="Всего юзеров" value={stats?.total_users} />
           <StatCard icon={Crown} label="Luxury" value={stats?.premium_users} />
           <StatCard icon={Activity} label="Активные 24ч" value={stats?.active_24h} hint={`7д: ${stats?.active_7d ?? "—"}`} />
@@ -321,7 +337,7 @@ export default function AdminPanel({ open, onClose }) {
 
         <KeysPanel keys={stats?.gemini_keys} onRefresh={loadStats} />
 
-        <div className="px-5 pt-4 pb-2">
+        <div className="px-4 sm:px-5 pt-4 pb-2">
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-white/35" strokeWidth={1.75} />
             <input
@@ -335,7 +351,7 @@ export default function AdminPanel({ open, onClose }) {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-5 pb-5 space-y-1.5">
+        <div className="flex-1 overflow-y-auto px-4 sm:px-5 pb-5 space-y-1.5">
           {loading && (
             <div className="flex items-center justify-center py-10 text-white/40 gap-2">
               <Loader2 className="h-4 w-4 animate-spin" /> Загрузка…
