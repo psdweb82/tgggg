@@ -559,21 +559,29 @@ async def delete_conversation(cid: str, tg_id: int = Depends(get_current_tg_id))
 
 
 # ------------------------------------------------------------------ gemini streaming
-def _friendly_error(status_code: int, body: str) -> str:
-    low = body.lower()
-    if status_code == 429 or "resource_exhausted" in low or "quota" in low:
-        return "Лимит на эту модель исчерпан (free-tier). Попробуйте позже."
-    if status_code == 400 and "api key" in low:
-        return "Проблема с API ключом Gemini."
-    if status_code == 400 and "safety" in low:
-        return "Запрос заблокирован фильтрами безопасности. Переформулируйте запрос."
-    if status_code == 404:
-        return "Модель недоступна на этом API-ключе."
-    if status_code in (401, 403):
-        return "Нет доступа к модели. Проверьте API ключ."
-    if status_code >= 500:
-        return "Серверы Gemini временно недоступны. Попробуйте ещё раз через минуту."
-    return f"Ошибка Gemini API ({status_code})."
+# Дружелюбные сообщения для ПОЛЬЗОВАТЕЛЯ — без упоминания Gemini, квот, ключей, кодов.
+# Настоящая причина сохраняется в логах, KeyManager.last_reason и админ-статистике.
+_USER_MSG = {
+    "cooldown": "Сервис временно перегружен. Попробуйте ещё раз через несколько секунд.",
+    "daily_limit": "Сервис временно недоступен. Повторите попытку позже.",
+    "invalid": "Произошла временная ошибка. Попробуйте снова.",
+    "forbidden": "Произошла временная ошибка. Попробуйте снова.",
+    "broken": "Произошла временная ошибка. Попробуйте снова.",
+    "request": "Не удалось обработать запрос. Переформулируйте и попробуйте снова.",
+    "overloaded": "Сервис временно перегружен. Попробуйте ещё раз через несколько секунд.",
+    "network": "Произошла временная ошибка. Попробуйте снова.",
+}
+
+
+def _user_message(kind: str) -> str:
+    """Возвращает безопасное сообщение для пользователя по типу ошибки."""
+    return _USER_MSG.get(kind, _USER_MSG["broken"])
+
+
+def _real_reason(status_code: int, detail: str) -> str:
+    """Полная техническая причина для админа/логов (HTTP-код + текст Gemini, обрезанный)."""
+    snippet = " ".join((detail or "").split())[:200]
+    return f"HTTP {status_code}: {snippet}" if snippet else f"HTTP {status_code}"
 
 
 def _msg_parts_for_gemini(m: Dict[str, Any],
@@ -624,10 +632,7 @@ async def gemini_stream(model: str, history: List[Dict[str, Any]]):
                 await asyncio.sleep(wait + 0.2)
                 continue
             key_manager.record_503()
-            if wait is not None:
-                raise NoHealthyKeys(
-                    f"Сервис временно перегружен. Повторите через ~{int(wait) + 1} сек.")
-            raise NoHealthyKeys(last_err or "Нет доступных API-ключей. Попробуйте позже.")
+            raise NoHealthyKeys(_user_message("overloaded"))
 
         # Считаем переключение между ключами (failover) в рамках одного запроса.
         used_key_count += 1
@@ -667,36 +672,37 @@ async def gemini_stream(model: str, history: List[Dict[str, Any]]):
                     # не-200: читаем тело и решаем через KeyManager
                     detail = (await resp.aread()).decode("utf-8", "ignore")[:800]
                     kind = classify_error(resp.status_code, detail)
-                    last_err = _friendly_error(resp.status_code, detail)
+                    last_err = _user_message(kind)                # для ПОЛЬЗОВАТЕЛЯ — дружелюбно
+                    reason = _real_reason(resp.status_code, detail)  # для АДМИНА/логов — реальная причина
                     logger.error("Gemini error %s (key #%s, kind=%s, attempt %s/%s): %s",
-                                 resp.status_code, key_idx, kind, attempt, GEMINI_MAX_ATTEMPTS, detail[:200])
+                                 resp.status_code, key_idx, kind, attempt, GEMINI_MAX_ATTEMPTS, detail[:300])
 
                     if kind == "daily_limit":
-                        key_manager.report_daily_limit(key_idx)
+                        key_manager.report_daily_limit(key_idx, reason)
                         continue  # failover на следующий ключ
                     if kind == "cooldown":
                         key_manager.report_rate_limit(
-                            key_idx, parse_retry_after(detail, dict(resp.headers)))
+                            key_idx, parse_retry_after(detail, dict(resp.headers)), reason)
                         continue
                     if kind == "invalid":
-                        key_manager.report_invalid(key_idx)
+                        key_manager.report_invalid(key_idx, reason)
                         continue
                     if kind == "forbidden":
-                        key_manager.report_forbidden(key_idx)
+                        key_manager.report_forbidden(key_idx, reason)
                         continue
                     if kind == "broken":
-                        key_manager.report_server_error(key_idx, attempt)
+                        key_manager.report_server_error(key_idx, attempt, reason)
                         continue
                     # прочие 4xx (safety / валидация) — не проблема ключа, не ретраим
                     raise NoHealthyKeys(last_err)
         except httpx.HTTPError as e:
             logger.warning("Gemini network error (key #%s, attempt %s): %s", key_idx, attempt, e)
-            key_manager.report_network_error(key_idx)
-            last_err = "Сеть недоступна. Попробуйте ещё раз."
+            key_manager.report_network_error(key_idx, f"network error: {e}")
+            last_err = _user_message("network")
             continue
 
     key_manager.record_503()
-    raise NoHealthyKeys(last_err or "Не удалось получить ответ Gemini.")
+    raise NoHealthyKeys(last_err or _user_message("broken"))
 
 
 async def _probe_keys_on_startup() -> None:
@@ -1157,8 +1163,10 @@ async def admin_grant_premium(body: PremiumGrant,
         {"tg_id": user["tg_id"]},
         {"$set": {"is_premium": True, "premium_until": until}},
     )
+    # Сбрасываем окно использования: после выдачи Luxury доступны все 60 запросов.
+    await db.user_requests.delete_many({"tg_id": user["tg_id"]})
     updated = await db.users.find_one({"tg_id": user["tg_id"]})
-    logger.info("Admin %s granted premium (days=%s) to tg_id=%s @%s",
+    logger.info("Admin %s granted premium (days=%s) to tg_id=%s @%s (usage window reset)",
                 _admin.get("tg_id"), body.days, user["tg_id"], user.get("username"))
     return _admin_user_out(updated)
 
